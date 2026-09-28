@@ -1,0 +1,15 @@
+[Unit]
+Description=Battery care: re-apply Acer health mode (80 % cap) and AC power profile
+Documentation=file:///usr/local/bin/battery-care
+After=systemd-modules-load.service power-profiles-daemon.service
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+ConditionPathExists=/etc/battery-care.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/battery-care boot
+
+[Install]
+WantedBy=multi-user.target
+# Re-run right after resume: the firmware may reset the health mode.
+WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

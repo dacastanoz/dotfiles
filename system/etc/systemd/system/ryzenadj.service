@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply Ryzen SMU thermal and power limits via ryzenadj
+# Also re-applied right after resume (firmware resets SMU limits on suspend).
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+# Normal: --tctl-temp=80 15/15/20 W; reduced (10/10/12 W, 75 C) while thermal-guard is critical.
+ExecStart=/usr/local/bin/ryzenadj-apply
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

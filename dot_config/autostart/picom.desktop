@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=picom
+Comment=Disabled: i3 config starts picom itself (avoids a duplicate launch via dex)
+Exec=picom
+Hidden=true

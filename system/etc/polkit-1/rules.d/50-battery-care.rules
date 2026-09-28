@@ -1,0 +1,9 @@
+// Let local, active wheel users run the whitelisted battery-care commands
+// (charge limit, calibration) through pkexec without a password.
+// The helper itself refuses every other command when started via pkexec.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.local.battery-care" &&
+        subject.local && subject.active && subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});

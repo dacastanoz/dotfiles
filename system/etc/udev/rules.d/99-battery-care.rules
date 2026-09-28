@@ -1,0 +1,4 @@
+# AC adapter plugged/unplugged -> battery-care ac-event (profile switch, idempotent).
+# `restart` (not start) so a change that arrives while the previous run is still
+# active is handled again with the newest AC state.
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block restart battery-care-ac.service"

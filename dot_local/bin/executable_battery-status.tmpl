@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# battery-status - user-side battery tools (battery and AC adapter names are filled in by chezmoi).
+#
+# Usage:
+#   battery-status info                  key=value summary (capacity, W, times, health...)
+#   battery-status health-mesg           Pango health section for the rofi battery menu
+#   battery-status polybar-tail          polybar tail module: charge-limit / profile glyphs
+#                                        (refreshes every 15 s or on SIGUSR1)
+#   battery-status refresh               make the polybar module redraw now
+#   battery-status cycle-profile         power-saver -> balanced -> performance -> ...
+#   battery-status set-profile <name>    powerprofilesctl set <name> (+ bar refresh)
+#   battery-status toggle-limit          toggle the 80 % limit (pkexec battery-care)
+#   battery-status record                append today's health point to the CSV (daily timer)
+#   battery-status trend                 trend lines (first vs latest, per month, sparkline)
+#   battery-status history [--wait]      health chart in the terminal
+#   battery-status history-popup         the chart in a floating ghostty popup
+#   battery-status alert [--dry-run] [--capacity N] [--status S]
+#                                        low-battery check (user timer, every 60 s):
+#                                        20 % normal, 10 % critical, 5 % persistent + sound.
+#                                        Never suspends / hibernates / powers off.
+# Env (tests): BATTERY_STATUS_CSV, BATTERY_STATUS_ALERT_STATE, BATTERY_STATUS_BAT,
+#              BATTERY_STATUS_TODAY (YYYY-MM-DD)
+set -u
+
+BAT=${BATTERY_STATUS_BAT:-/sys/class/power_supply/{{ .batteryName | default "BAT0" }}}
+AC=/sys/class/power_supply/{{ .adapterName | default "AC" }}/online
+WMI=/sys/bus/wmi/drivers/acer-wmi-battery
+CSV=${BATTERY_STATUS_CSV:-${XDG_DATA_HOME:-$HOME/.local/share}/battery-care/health.csv}
+ALERT_STATE=${BATTERY_STATUS_ALERT_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/battery-care/alert-level}
+TG_STATE=/run/thermal-guard/state
+HELPER=/usr/local/bin/battery-care
+APP="Battery"
+# Nord
+C_GREEN="#a3be8c" C_YELLOW="#ebcb8b" C_RED="#bf616a" C_MUTED="#4c566a" C_FROST="#88c0d0" C_ORANGE="#d08770"
+
+notify() { # notify <urgency> <icon> <summary> [body] [extra args...]
+    local u=$1 i=$2 s=$3 b=${4:-}
+    shift $(( $# < 4 ? $# : 4 ))
+    notify-send -a "$APP" -u "$u" -i "$i" "$@" "$s" "$b" 2>/dev/null || true
+}
+
+read_uevent() { # sets B_* variables from the battery uevent
+    local key val
+    B_STATUS=Unknown B_CAPACITY=0 B_CHARGE_NOW=0 B_CHARGE_FULL=0 B_CHARGE_DESIGN=0
+    B_CURRENT=0 B_VOLTAGE=0 B_VMIN=0 B_CYCLES=0
+    [[ -r $BAT/uevent ]] || return 1
+    while IFS='=' read -r key val; do
+        case $key in
+            POWER_SUPPLY_STATUS) B_STATUS=$val ;;
+            POWER_SUPPLY_CAPACITY) B_CAPACITY=$val ;;
+            POWER_SUPPLY_CHARGE_NOW) B_CHARGE_NOW=$val ;;
+            POWER_SUPPLY_CHARGE_FULL) B_CHARGE_FULL=$val ;;
+            POWER_SUPPLY_CHARGE_FULL_DESIGN) B_CHARGE_DESIGN=$val ;;
+            POWER_SUPPLY_CURRENT_NOW) B_CURRENT=$val ;;
+            POWER_SUPPLY_VOLTAGE_NOW) B_VOLTAGE=$val ;;
+            POWER_SUPPLY_VOLTAGE_MIN_DESIGN) B_VMIN=$val ;;
+            POWER_SUPPLY_CYCLE_COUNT) B_CYCLES=$val ;;
+        esac
+    done <"$BAT/uevent"
+}
+
+sysfs() { local v=""; [[ -r $1 ]] && read -r v <"$1" 2>/dev/null; printf '%s' "$v"; }
+
+active_profile() {
+    local p
+    p=$(busctl get-property org.freedesktop.UPower.PowerProfiles /org/freedesktop/UPower/PowerProfiles \
+        org.freedesktop.UPower.PowerProfiles ActiveProfile 2>/dev/null) || p=""
+    p=${p#s \"}; p=${p%\"}
+    printf '%s' "${p:-unknown}"
+}
+
+tg_level() {
+    local key val level=0
+    [[ -r $TG_STATE ]] && while IFS='=' read -r key val; do [[ $key == level ]] && level=$val; done <"$TG_STATE"
+    [[ $level =~ ^[0-9]+$ ]] || level=0
+    printf '%s' "$level"
+}
+
+fmt_hours() { # fmt_hours <float hours> -> "2 h 05 min"
+    awk -v h="$1" 'BEGIN { m = int(h * 60 + 0.5); if (m <= 0) { print "-"; exit }
+        if (m >= 60) printf "%d h %02d min\n", int(m / 60), m % 60; else printf "%d min\n", m }'
+}
+
+health_color() { # health_color <percent>
+    awk -v h="$1" -v g="$C_GREEN" -v y="$C_YELLOW" -v r="$C_RED" \
+        'BEGIN { if (h >= 80) print g; else if (h >= 60) print y; else print r }'
+}
+
+# --------------------------------------------------------------------------- info
+cmd_info() {
+    local ac limit calib profile power health time_label="" time_val="-" target
+    read_uevent || { echo "battery=missing"; return 1; }
+    ac=$(sysfs "$AC"); limit=$(sysfs "$WMI/health_mode"); calib=$(sysfs "$WMI/calibration_mode")
+    profile=$(active_profile)
+    power=$(awk -v i="$B_CURRENT" -v v="$B_VOLTAGE" 'BEGIN { printf "%.1f", i * v / 1e12 }')
+    health=$(awk -v f="$B_CHARGE_FULL" -v d="$B_CHARGE_DESIGN" 'BEGIN { if (d > 0) printf "%.1f", f * 100 / d; else print 0 }')
+    if (( B_CURRENT > 0 )); then
+        case $B_STATUS in
+            Discharging)
+                time_label="Time to empty"
+                time_val=$(fmt_hours "$(awk -v n="$B_CHARGE_NOW" -v i="$B_CURRENT" 'BEGIN { print n / i }')") ;;
+            Charging)
+                target=$B_CHARGE_FULL
+                [[ $limit == 1 && $calib != 1 ]] && target=$(( B_CHARGE_FULL * 80 / 100 ))
+                time_label="Time to full"
+                [[ $limit == 1 && $calib != 1 ]] && time_label="Time to 80 %"
+                time_val=$(fmt_hours "$(awk -v t="$target" -v n="$B_CHARGE_NOW" -v i="$B_CURRENT" 'BEGIN { x = (t - n) / i; print (x > 0 ? x : 0) }')") ;;
+        esac
+    fi
+    printf 'capacity=%s\nstatus=%s\nac=%s\npower_w=%s\n' "$B_CAPACITY" "$B_STATUS" "${ac:-?}" "$power"
+    printf 'time_label=%s\ntime=%s\n' "${time_label:-Time}" "$time_val"
+    printf 'health=%s\nfull_mah=%s\ndesign_mah=%s\n' "$health" $(( B_CHARGE_FULL / 1000 )) $(( B_CHARGE_DESIGN / 1000 ))
+    awk -v f="$B_CHARGE_FULL" -v d="$B_CHARGE_DESIGN" -v v="$B_VMIN" \
+        'BEGIN { printf "full_wh=%.1f\ndesign_wh=%.1f\n", f * v / 1e12, d * v / 1e12 }'
+    printf 'cycles=%s\nlimit=%s\ncalibration=%s\nprofile=%s\nthermal_level=%s\n' \
+        "$B_CYCLES" "${limit:-missing}" "${calib:-missing}" "$profile" "$(tg_level)"
+}
+
+# ---------------------------------------------------------------- health / trend
+health_bar() { # health_bar <percent> [width] -> Pango colored bar
+    local h=$1 w=${2:-20} col
+    col=$(health_color "$h")
+    awk -v h="$h" -v w="$w" -v c="$col" -v m="$C_MUTED" 'BEGIN {
+        n = int(h * w / 100 + 0.5); if (n > w) n = w
+        full = ""; empty = ""
+        for (i = 0; i < n; i++) full = full "█"
+        for (i = n; i < w; i++) empty = empty "░"
+        printf "<span foreground=\"%s\">%s</span><span foreground=\"%s\">%s</span>", c, full, m, empty }'
+}
+
+health_hint() { # plain-language hint
+    awk -v h="$1" 'BEGIN {
+        if (h >= 90) print "Like new. Keeping the 80 % limit on slows further wear."
+        else if (h >= 80) print "Good condition; keep the 80 % limit on for daily use."
+        else if (h >= 60) print "Normal wear for this age; keep the 80 % limit on."
+        else print "Heavily worn: expect short runtimes; consider a replacement battery." }'
+}
+
+# trend_lines: print "first|latest|rate|spark" computed from the CSV (tab-separated fields).
+trend_fields() {
+    local today=${BATTERY_STATUS_TODAY:-$(date +%F)}
+    [[ -r $CSV ]] || { printf 'none\n'; return 0; }
+    awk -F, -v today="$today" '
+        function days(d,  c) { c = "date -u -d " d " +%s"; c | getline s; close(c); return s / 86400 }
+        NR == 1 && $1 == "date" { next }
+        $1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ && $4 != "" { n++; D[n] = $1; H[n] = $4 + 0 }
+        END {
+            if (n == 0) { print "none"; exit }
+            span = (n >= 2) ? days(D[n]) - days(D[1]) : 0
+            rate = "-"
+            if (n >= 2 && span >= 7) rate = sprintf("%+.2f", (H[n] - H[1]) / span * 30.44)
+            # sparkline of the last 20 points
+            s = (n > 20) ? n - 19 : 1; lo = 1000; hi = -1
+            for (i = s; i <= n; i++) { if (H[i] < lo) lo = H[i]; if (H[i] > hi) hi = H[i] }
+            split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", B, " "); sp = ""
+            for (i = s; i <= n; i++) {
+                k = (hi - lo < 0.05) ? 5 : int((H[i] - lo) / (hi - lo) * 7 + 0.5) + 1
+                sp = sp B[k]
+            }
+            printf "%s\t%.1f\t%s\t%.1f\t%s\t%d\t%d\t%s\n", D[1], H[1], D[n], H[n], rate, span, n, sp
+        }' "$CSV"
+}
+
+cmd_trend() {
+    local f first fh last lh rate span n spark
+    f=$(trend_fields)
+    if [[ $f == none ]]; then echo "History: no data yet (daily timer records one point per day)"; return 0; fi
+    IFS=$'\t' read -r first fh last lh rate span n spark <<<"$f"
+    printf 'First recorded: %s %s %%\n' "$first" "$fh"
+    printf 'Latest:         %s %s %%\n' "$last" "$lh"
+    if [[ $rate == - ]]; then printf 'Trend: collecting data since %s (%s point(s))\n' "$first" "$n"
+    else printf 'Trend: %s %%/month over %s days (%s points)\n' "$rate" "$span" "$n"; fi
+    printf 'Sparkline: %s\n' "$spark"
+}
+
+cmd_health_mesg() { # Pango block for rofi -mesg
+    local info health full_mah design_mah full_wh design_wh lost col f first fh last lh rate span n spark trend
+    info=$(cmd_info) || { echo "Battery not found"; return 0; }
+    health=$(get health <<<"$info"); full_mah=$(get full_mah <<<"$info"); design_mah=$(get design_mah <<<"$info")
+    full_wh=$(get full_wh <<<"$info"); design_wh=$(get design_wh <<<"$info")
+    lost=$(awk -v h="$health" 'BEGIN { printf "%.0f", 100 - h }')
+    col=$(health_color "$health")
+    printf '<b>Battery health</b>  %s  <span foreground="%s"><b>%s %%</b></span>\n' "$(health_bar "$health")" "$col" "$health"
+    printf 'Full capacity <b>%s mAh</b> (%s Wh) of %s mAh (%s Wh) design  ·  lost ~%s %% since new\n' \
+        "$full_mah" "$full_wh" "$design_mah" "$design_wh" "$lost"
+    printf '<i>%s</i>\n' "$(health_hint "$health")"
+    f=$(trend_fields)
+    if [[ $f == none ]]; then
+        trend="History: no data yet"
+    else
+        IFS=$'\t' read -r first fh last lh rate span n spark <<<"$f"
+        if [[ $rate == - ]]; then
+            trend=$(printf 'History: collecting data since %s  <span foreground="%s">%s</span>' "$first" "$C_FROST" "$spark")
+        else
+            trend=$(printf 'History: %s %s %% → %s %s %%  (<b>%s %%/month</b>)  <span foreground="%s">%s</span>' \
+                "$first" "$fh" "$last" "$lh" "$rate" "$C_FROST" "$spark")
+        fi
+    fi
+    printf '%s' "$trend"
+}
+
+get() { local k=$1 line; while IFS= read -r line; do [[ $line == "$k="* ]] && { printf '%s' "${line#*=}"; return; }; done; }
+
+# ---------------------------------------------------------------------- record
+cmd_record() {
+    local today tmp health
+    read_uevent || { echo "battery missing" >&2; return 1; }
+    (( B_CHARGE_DESIGN > 0 && B_CHARGE_FULL > 0 )) || { echo "no capacity data" >&2; return 1; }
+    today=${BATTERY_STATUS_TODAY:-$(date +%F)}
+    health=$(awk -v f="$B_CHARGE_FULL" -v d="$B_CHARGE_DESIGN" 'BEGIN { printf "%.1f", f * 100 / d }')
+    mkdir -p "$(dirname "$CSV")"
+    tmp=$(mktemp "$CSV.XXXXXX") || return 1
+    # Keep every other day's point; today's point is replaced (same-day dedupe).
+    if {
+        echo "date,charge_full,charge_full_design,health"
+        {
+            [[ -r $CSV ]] && awk -F, -v t="$today" '$1 ~ /^[0-9]{4}-/ && $1 != t && NF >= 4' "$CSV"
+            printf '%s,%s,%s,%s\n' "$today" "$B_CHARGE_FULL" "$B_CHARGE_DESIGN" "$health"
+        } | sort -t, -k1,1
+    } >"$tmp"; then
+        mv -f "$tmp" "$CSV"
+    else
+        rm -f "$tmp"; return 1
+    fi
+    echo "recorded $today health=$health% ($CSV)"
+}
+
+# --------------------------------------------------------------------- history
+cmd_history() {
+    local wait=${1:-}
+    printf '\n  \e[1mBattery health history\e[0m  (%s)\n\n' "$CSV"
+    if [[ ! -r $CSV ]] || (( $(wc -l <"$CSV") < 2 )); then
+        echo "  No data yet: the daily timer (battery-health.timer) records one point per day."
+    else
+        awk -F, -v W=60 -v R=12 '
+            function days(d,  c, s) { c = "date -u -d " d " +%s"; c | getline s; close(c); return s / 86400 }
+            NR == 1 && $1 == "date" { next }
+            $1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/ { n++; D[n] = $1; H[n] = $4 + 0; X[n] = days($1) }
+            END {
+                lo = 100; hi = 0
+                for (i = 1; i <= n; i++) { if (H[i] < lo) lo = H[i]; if (H[i] > hi) hi = H[i] }
+                ymin = int(lo) - 3; ymax = int(hi + 0.999) + 2
+                if (ymin < 0) ymin = 0; if (ymax > 100) ymax = 100; if (ymax - ymin < 6) ymin = ymax - 6
+                span = X[n] - X[1]
+                # value per column (step: last point at or before the column date)
+                for (c = 0; c < W; c++) {
+                    if (n == 1 || span <= 0) { V[c] = H[n]; continue }
+                    t = X[1] + span * c / (W - 1); v = H[1]
+                    for (i = 1; i <= n; i++) if (X[i] <= t + 1e-9) v = H[i]
+                    V[c] = v
+                }
+                split("▁ ▂ ▃ ▄ ▅ ▆ ▇ █", B, " ")
+                step = (ymax - ymin) / R
+                for (r = R - 1; r >= 0; r--) {
+                    base = ymin + r * step
+                    line = ""
+                    for (c = 0; c < W; c++) {
+                        f = (V[c] - base) / step
+                        if (f >= 1) ch = "█"; else if (f <= 0) ch = " "; else { k = int(f * 8); ch = (k < 1) ? " " : B[k] }
+                        line = line ch
+                    }
+                    col = (V[W-1] >= 80) ? "\033[32m" : (V[W-1] >= 60) ? "\033[33m" : "\033[31m"
+                    if (r % 3 == 2 || r == R - 1) lab = sprintf("%5.1f%%", base + step); else lab = "      "
+                    printf "  %s │%s%s\033[0m\n", lab, col, line
+                }
+                printf "  %5.1f%% └", ymin; for (c = 0; c < W; c++) printf "─"; printf "\n"
+                printf "          %-30s%30s\n\n", D[1], D[n]
+                printf "  Points: %d over %d days\n\n  Last entries:\n", n, span
+                s = (n > 10) ? n - 9 : 1
+                for (i = s; i <= n; i++) printf "    %s  %5.1f %%\n", D[i], H[i]
+            }' "$CSV"
+        echo
+        cmd_trend | sed 's/^/  /'
+    fi
+    if [[ $wait == --wait ]]; then printf '\n  Press any key to close '; read -rsn1 _ </dev/tty || sleep 30; fi
+}
+
+cmd_history_popup() {
+    ghostty --class=dev.gentleman.popup --window-width=0 --window-height=0 \
+        --title="Battery health history" -e "$0" history --wait >/dev/null 2>&1 &
+}
+
+# --------------------------------------------------------------------- polybar
+polybar_line() {
+    local limit calib profile glyph out="" health
+    limit=$(sysfs "$WMI/health_mode"); calib=$(sysfs "$WMI/calibration_mode")
+    profile=$(active_profile)
+    if [[ $calib == 1 ]]; then out="%{F$C_ORANGE}󰑓 cal%{F-} "
+    elif [[ $limit == 1 ]]; then out="%{F$C_YELLOW}󰌾80%{F-} "; fi
+    case $profile in
+        performance) glyph="%{F$C_RED}󰓅%{F-}" ;;
+        balanced)    glyph="%{F$C_FROST}󰾅%{F-}" ;;
+        power-saver) glyph="%{F$C_GREEN}󰌪%{F-}" ;;
+        *)           glyph="" ;;
+    esac
+    out+=$glyph
+    read_uevent && health=$(( B_CHARGE_DESIGN > 0 ? B_CHARGE_FULL * 100 / B_CHARGE_DESIGN : 100 ))
+    (( ${health:-100} < 60 )) && out+=" %{F$C_RED}󰂃${health}%%{F-}"
+    printf '%s\n' "$out"
+}
+
+cmd_polybar_tail() {
+    local pid
+    trap 'kill "$pid" 2>/dev/null' USR1
+    while :; do
+        polybar_line
+        sleep 15 & pid=$!
+        wait "$pid"
+    done
+}
+
+cmd_refresh() { pkill -USR1 -f 'battery-status polybar-tail' 2>/dev/null || true; }
+
+cmd_set_profile() {
+    local p=$1 level
+    case $p in performance|balanced|power-saver) ;; *) echo "invalid profile: $p" >&2; return 2 ;; esac
+    level=$(tg_level)
+    if (( level > 0 )); then
+        notify normal dialog-warning "Power profile unchanged" "Thermal guard is throttling (level $level); it restores the profile when temperatures drop."
+        return 1
+    fi
+    if powerprofilesctl set "$p" 2>/dev/null; then
+        notify low battery "Power profile: $p" ""
+    else
+        notify normal dialog-error "Could not set power profile $p" ""
+    fi
+    cmd_refresh
+}
+
+cmd_cycle_profile() {
+    case $(active_profile) in
+        power-saver) cmd_set_profile balanced ;;
+        balanced)    cmd_set_profile performance ;;
+        *)           cmd_set_profile power-saver ;;
+    esac
+}
+
+cmd_toggle_limit() {
+    local out
+    if out=$(SHELL=/bin/bash pkexec "$HELPER" health toggle 2>&1); then
+        if [[ $out == *HEALTH_MODE=1* ]]; then
+            notify normal battery-good "Charge limit ON" "Charging stops at 80 % to slow battery wear."
+        else
+            notify normal battery-full-charged "Charge limit OFF" "The battery charges to 100 %."
+        fi
+    else
+        notify critical dialog-error "Could not change the charge limit" "$out"
+    fi
+    cmd_refresh
+}
+
+# ----------------------------------------------------------------------- alerts
+cmd_alert() {
+    local dry=0 cap="" status="" last=100 level=100 sound=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
+    while (( $# )); do
+        case $1 in
+            --dry-run) dry=1 ;;
+            --capacity) cap=$2; shift ;;
+            --status) status=$2; shift ;;
+        esac
+        shift
+    done
+    if [[ -z $cap || -z $status ]]; then
+        read_uevent || return 0
+        cap=${cap:-$B_CAPACITY}; status=${status:-$B_STATUS}
+    fi
+    mkdir -p "$(dirname "$ALERT_STATE")"
+    [[ -r $ALERT_STATE ]] && read -r last <"$ALERT_STATE"
+    [[ $last =~ ^[0-9]+$ ]] || last=100
+    if [[ $status != Discharging ]]; then
+        # new discharge cycle starts after any charge / AC connection
+        [[ $last != 100 ]] && echo 100 >"$ALERT_STATE"
+        (( dry )) && echo "status=$status: reset (no alert)"
+        return 0
+    fi
+    if (( cap <= 5 )); then level=5; elif (( cap <= 10 )); then level=10; elif (( cap <= 20 )); then level=20; fi
+    if (( level >= last )); then
+        if (( dry )); then
+            if (( level == 100 )); then echo "capacity=$cap: above 20 %, no alert"
+            else echo "capacity=$cap: nothing new (threshold $last already notified)"; fi
+        fi
+        return 0
+    fi
+    echo "$level" >"$ALERT_STATE"
+    if (( dry )); then echo "capacity=$cap: ALERT level $level"; return 0; fi
+    # Only when a desktop session is up (the timer also runs before login with linger).
+    pgrep -u "$UID" -x dunst >/dev/null || pgrep -u "$UID" -x i3 >/dev/null || return 0
+    case $level in
+        20) notify normal battery-low "Battery low: $cap %" "Plug in the charger soon." ;;
+        10) notify critical battery-caution "Battery critical: $cap %" "Plug in the charger now." ;;
+        5)  notify critical battery-empty "Battery almost empty: $cap %" "Plug in the charger NOW. Save your work." -t 0
+            timeout 10 paplay "$sound" 2>/dev/null || true ;;
+    esac
+}
+
+case ${1:-} in
+    info)          cmd_info ;;
+    health-mesg)   cmd_health_mesg ;;
+    polybar)       polybar_line ;;
+    polybar-tail)  cmd_polybar_tail ;;
+    refresh)       cmd_refresh ;;
+    cycle-profile) cmd_cycle_profile ;;
+    set-profile)   cmd_set_profile "${2:-}" ;;
+    toggle-limit)  cmd_toggle_limit ;;
+    record)        cmd_record ;;
+    trend)         cmd_trend ;;
+    history)       cmd_history "${2:-}" ;;
+    history-popup) cmd_history_popup ;;
+    alert)         shift; cmd_alert "$@" ;;
+    *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+esac

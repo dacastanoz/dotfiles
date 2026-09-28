@@ -1,0 +1,7 @@
+[Unit]
+Description=Record battery health (charge_full / design) to ~/.local/share/battery-care/health.csv
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/battery-status record
+Nice=10

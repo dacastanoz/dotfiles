@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind graphical-session.target for i3
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleep infinity
+
+[Install]
+WantedBy=default.target

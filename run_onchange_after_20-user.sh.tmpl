@@ -1,0 +1,67 @@
+#!/bin/bash
+# User-level setup after the dotfiles are in place (idempotent, no sudo except papirus-folders).
+# Re-runs when these change:
+#   drive-sync units {{ include "dot_config/systemd/user/drive-sync.timer" | sha256sum | trunc 16 }} {{ include "dot_config/systemd/user/drive-sync.service.tmpl" | sha256sum | trunc 16 }}
+#   mimeapps.list    {{ include "dot_config/mimeapps.list" | sha256sum | trunc 16 }}
+#   i3 config        {{ include "dot_config/i3/config.tmpl" | sha256sum | trunc 16 }}
+#   battery units    {{ include "dot_config/systemd/user/battery-alert.timer" | sha256sum | trunc 16 }} {{ include "dot_config/systemd/user/battery-health.timer" | sha256sum | trunc 16 }}
+set -uo pipefail
+
+say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+has() { command -v "$1" >/dev/null 2>&1; }
+notes=()
+
+# ---------------------------------------------------------------- systemd --user
+if systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+    remotes="${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync/remotes.conf"
+    if [ -f "$remotes" ] && has rclone; then
+        systemctl --user enable --now drive-sync.timer >/dev/null 2>&1 && say "drive-sync.timer enabled"
+    else
+        notes+=("Drive sync is off: run 'rclone config', then copy ~/.config/drive-sync/remotes.conf.example to remotes.conf and run 'chezmoi apply'")
+    fi
+    systemctl --user enable i3-graphical-session.service >/dev/null 2>&1 || true
+{{- if .hasBattery }}
+    systemctl --user enable --now battery-alert.timer battery-health.timer >/dev/null 2>&1 || true
+{{- end }}
+else
+    notes+=("systemd --user not reachable (run 'chezmoi apply' again from a desktop session)")
+fi
+
+# ---------------------------------------------------------------- icons, theme, default apps
+if has papirus-folders && ! papirus-folders -l --theme Papirus-Dark 2>/dev/null | grep -q '> nordic'; then
+    say "Papirus folder color -> nordic (sudo)"
+    sudo papirus-folders -C nordic --theme Papirus-Dark >/dev/null || notes+=("papirus-folders failed")
+fi
+
+if has gsettings; then
+    gs() { [ "$(gsettings get "$1" "$2" 2>/dev/null)" = "'$3'" ] || gsettings set "$1" "$2" "$3" 2>/dev/null || true; }
+    gs org.gnome.desktop.interface icon-theme Papirus-Dark
+    gs org.gnome.desktop.interface gtk-theme cachyos-nord
+    gs org.gnome.desktop.interface color-scheme prefer-dark
+    gs org.gnome.desktop.interface cursor-theme capitaine-cursors
+    gs org.gnome.desktop.default-applications.terminal exec ghostty
+    gs org.gnome.desktop.default-applications.terminal exec-arg -e
+fi
+
+# mimeapps.list is managed by chezmoi; only fix the folder handler if something overrides it.
+if has xdg-mime && [ "$(xdg-mime query default inode/directory 2>/dev/null)" != thunar.desktop ]; then
+    xdg-mime default thunar.desktop inode/directory
+fi
+
+# ---------------------------------------------------------------- displays
+if [ -z "$(find "$HOME/.config/autorandr" -mindepth 2 -maxdepth 2 -name config 2>/dev/null)" ]; then
+    notes+=("No autorandr profiles yet: arrange your screens (Super+p or arandr), then 'autorandr --save <name>'")
+fi
+
+# ---------------------------------------------------------------- reload the running desktop
+if [ -n "${DISPLAY:-}" ] && pgrep -x i3 >/dev/null 2>&1; then
+    i3-msg reload >/dev/null 2>&1 && say "i3 reloaded"
+    [ -x "$HOME/.config/polybar/launch.sh" ] && "$HOME/.config/polybar/launch.sh" >/dev/null 2>&1 &
+fi
+
+if [ "${#notes[@]}" -gt 0 ]; then
+    say "notes"
+    printf '  - %s\n' "${notes[@]}"
+fi
+exit 0

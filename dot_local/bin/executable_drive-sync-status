@@ -1,0 +1,166 @@
+#!/bin/bash
+# drive-sync-status: short status line for polybar + click menu for drive-sync.
+#
+# Usage:
+#   drive-sync-status           polybar-formatted status (Nerd Font icon + text, Nord colors)
+#   drive-sync-status --plain   same without polybar color tags
+#   drive-sync-status --long    per-remote details (for terminals / rofi message)
+#   drive-sync-status --click   rofi menu: sync now, open log, open folder, resync a remote
+#
+# polybar:
+#   [module/drive]
+#   type = custom/script
+#   exec = ~/.local/bin/drive-sync-status
+#   interval = 15
+#   click-left = ~/.local/bin/drive-sync-status --click &
+
+set -u
+export LC_ALL=C.UTF-8
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drive-sync"
+LOGFILE="$HOME/.local/share/rclone/bisync.log"
+LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/drive-sync-${UID}.lock"
+TERMINAL="${TERMINAL:-ghostty}"
+REMOTES_CONF="${DRIVE_SYNC_REMOTES:-${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync/remotes.conf}"
+
+# Remote names and the folder opened by "Open Drive folder" (parent of the first local folder)
+# come from the machine-local remotes.conf used by drive-sync.
+NAMES=()
+DRIVE_DIR="$HOME"
+if [ -r "$REMOTES_CONF" ]; then
+    while IFS='|' read -r r_name _ r_dir _; do
+        case "$r_name" in ''|'#'*) continue ;; esac
+        if [ "${#NAMES[@]}" -eq 0 ] && [ -n "$r_dir" ]; then
+            case "$r_dir" in
+                \~/*) r_dir="$HOME/${r_dir#\~/}" ;;
+                \$HOME*) r_dir="$HOME${r_dir#\$HOME}" ;;
+            esac
+            DRIVE_DIR=$(dirname "$r_dir")
+        fi
+        NAMES+=("$r_name")
+    done <"$REMOTES_CONF"
+fi
+
+ICON_OK=$'\U000F0160'      # nf-md-cloud_check
+ICON_SYNC=$'\U000F063F'    # nf-md-cloud_sync
+ICON_ERR=$'\U000F09E0'     # nf-md-cloud_alert
+ICON_OFF=$'\U000F0164'     # nf-md-cloud_off_outline
+
+C_OK="#A3BE8C" C_SYNC="#88C0D0" C_ERR="#BF616A" C_WARN="#EBCB8B" C_OFF="#616E88"
+
+status_get() { # file key
+    [ -f "$1" ] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [ "$k" = "$2" ] && { printf '%s' "$v"; return 0; }
+    done <"$1"
+}
+
+ago() { # epoch -> "5m" / "3h" / "2d" / "never"
+    local t="${1:-0}" d
+    [ "$t" -gt 0 ] 2>/dev/null || { echo never; return; }
+    d=$(( $(date +%s) - t ))
+    if [ "$d" -lt 60 ]; then echo "now"
+    elif [ "$d" -lt 3600 ]; then echo "$((d / 60))m"
+    elif [ "$d" -lt 86400 ]; then echo "$((d / 3600))h"
+    else echo "$((d / 86400))d"; fi
+}
+
+is_syncing() {
+    [ -e "$LOCKFILE" ] || return 1
+    ! flock -n "$LOCKFILE" true 2>/dev/null
+}
+
+print_status() { # plain(0/1)
+    local plain="$1" icon color text n st worst="" oldest_ok=0 all_offline=1 last_ok
+    for n in "${NAMES[@]}"; do
+        st=$(status_get "$STATE_DIR/$n.status" state)
+        last_ok=$(status_get "$STATE_DIR/$n.status" last_ok)
+        [ "$st" = offline ] || all_offline=0
+        case "$st" in
+            needs-resync|auth|too-many-deletes|error) worst="$st" ;;
+            rate-limited|locked) [ -z "$worst" ] && worst="$st" ;;
+        esac
+        # The status line shows the oldest successful sync among remotes.
+        if [ "${last_ok:-0}" -gt 0 ] 2>/dev/null; then
+            if [ "$oldest_ok" -eq 0 ] || [ "$last_ok" -lt "$oldest_ok" ]; then oldest_ok="$last_ok"; fi
+        fi
+    done
+
+    if is_syncing; then
+        icon="$ICON_SYNC" color="$C_SYNC" text="sync"
+    elif [ ! -d "$STATE_DIR" ] || [ -z "$(fd -e status . "$STATE_DIR" 2>/dev/null)" ]; then
+        icon="$ICON_OFF" color="$C_OFF" text="n/a"
+    elif [ "$all_offline" -eq 1 ]; then
+        icon="$ICON_OFF" color="$C_OFF" text="offline"
+    elif [ -n "$worst" ]; then
+        case "$worst" in
+            rate-limited|locked) icon="$ICON_ERR" color="$C_WARN" text="retry" ;;
+            needs-resync) icon="$ICON_ERR" color="$C_ERR" text="resync" ;;
+            auth) icon="$ICON_ERR" color="$C_ERR" text="auth" ;;
+            too-many-deletes) icon="$ICON_ERR" color="$C_ERR" text="deletes" ;;
+            *) icon="$ICON_ERR" color="$C_ERR" text="error" ;;
+        esac
+    else
+        icon="$ICON_OK" color="$C_OK" text="$(ago "$oldest_ok")"
+    fi
+
+    if [ "$plain" -eq 1 ]; then
+        echo "$icon $text"
+    else
+        echo "%{F$color}$icon%{F-} $text"
+    fi
+}
+
+print_long() {
+    local n f
+    for n in "${NAMES[@]}"; do
+        f="$STATE_DIR/$n.status"
+        printf '%-17s %-16s ok %-6s %s\n' "$n" "$(status_get "$f" state)" \
+            "$(ago "$(status_get "$f" last_ok)")" "$(status_get "$f" message)"
+    done
+    is_syncing && echo "(sync in progress)"
+    return 0
+}
+
+term() { # command...
+    setsid -f "$TERMINAL" -e "$@" >/dev/null 2>&1
+}
+
+click_menu() {
+    local choice remote confirm
+    local sync_now="󰑐  Sync now"
+    local open_folder="󰉋  Open Drive folder"
+    local open_log="󰈙  Open log"
+    local dry_run="󰜎  Dry-run (preview changes)"
+    local resync="󰁯  Resync a remote…"
+    choice=$(printf '%s\n' "$sync_now" "$open_folder" "$open_log" "$dry_run" "$resync" \
+        | rofi -dmenu -i -p "Drive" -mesg "$(print_long | sd '&' '&amp;' | sd '<' '&lt;')" -no-custom) || exit 0
+
+    case "$choice" in
+        "$sync_now")
+            systemctl --user start --no-block drive-sync.service
+            notify-send -a "Drive sync" -i folder-cloud "Drive sync" "Sync started" ;;
+        "$open_folder")
+            setsid -f thunar "$DRIVE_DIR" >/dev/null 2>&1 ;;
+        "$open_log")
+            term less +G "$LOGFILE" ;;
+        "$dry_run")
+            # shellcheck disable=SC2016 # $HOME expands inside the child bash
+            term bash -c '"$HOME"/.local/bin/drive-sync --dry-run; echo; read -rp "Press Enter to close" _' ;;
+        "$resync")
+            remote=$(printf '%s\n' "${NAMES[@]}" | rofi -dmenu -i -p "Resync which remote" -no-custom) || exit 0
+            confirm=$(printf '%s\n' "No" "Yes, resync $remote" | rofi -dmenu -i -no-custom \
+                -p "Confirm" -mesg "Resync rebuilds the baseline: union copy, newer file wins, nothing is deleted (deleted files may come back).") || exit 0
+            [ "$confirm" = "Yes, resync $remote" ] || exit 0
+            term bash -c "$HOME/.local/bin/drive-sync --resync '$remote'; echo; read -rp 'Press Enter to close' _" ;;
+    esac
+}
+
+case "${1:-}" in
+    "") print_status 0 ;;
+    --plain) print_status 1 ;;
+    --long) print_long ;;
+    --click) click_menu ;;
+    *) echo "Usage: drive-sync-status [--plain|--long|--click]" >&2; exit 2 ;;
+esac

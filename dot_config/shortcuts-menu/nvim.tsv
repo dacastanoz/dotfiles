@@ -1,0 +1,41 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Basics	Space	Leader key (press and wait: which-key shows every command)
+Basics	Space s k	Search all keymaps
+Basics	Ctrl+s	Save file
+Basics	Space q q	Quit all
+Basics	Space l	Lazy (plugin manager)
+Basics	Space c m	Mason (LSP servers, formatters)
+Files	Space Space	Find files (project root)
+Files	Space f f	Find files
+Files	Space f r	Recent files
+Files	Space e	File explorer (Neo-tree)
+Files	Space f m	mini.files (folder of the current file)
+Search	Space /	Grep in project
+Search	Space s g	Grep (root dir)
+Search	Space s w	Grep word under cursor
+Search	Space s r	Search and replace (grug-far)
+Search	s	Flash jump (type 2 chars)
+Buffers	Space ,	Switch buffer
+Buffers	Shift+h / Shift+l	Previous / next buffer
+Buffers	Space b d	Delete buffer
+Windows	Space |	Split right (Space - opens Oil in this config)
+Windows	Ctrl+h / j / k / l	Move between splits and tmux panes
+LSP	gd	Go to definition
+LSP	gr	References
+LSP	K	Hover documentation
+LSP	Space c r	Rename symbol
+LSP	Space c a	Code action
+LSP	Space c f	Format
+Diagnostics	] d / [ d	Next / previous diagnostic
+Diagnostics	Space c d	Line diagnostics
+Diagnostics	Space x x	Diagnostics list (Trouble)
+Git	Space g g	lazygit inside Neovim
+Git	] h / [ h	Next / previous git hunk
+Terminal	Ctrl+/	Floating terminal (toggle)
+Editing	gcc / gc	Comment line / selection
+Editing	gsa / gsd / gsr	Surround add / delete / replace (mini.surround)
+Harpoon	Space H	Harpoon: add file
+Harpoon	Space h	Harpoon: quick menu
+Harpoon	Space 1..5	Harpoon: jump to file N

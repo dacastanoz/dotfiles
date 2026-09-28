@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Polybar temperature module + sensor summary + live monitor launcher.
+#   temperature.sh            one polybar label (CPU Tctl, colored by level, guard state)
+#   temperature.sh --summary  rofi summary of all sensors / power state
+#   temperature.sh --monitor  btop in a floating ghostty popup (live graphs)
+#   temperature.sh --plain    summary as plain text (stdout)
+# GPU power: amdgpu power1 on this APU is the whole package (label PPT).
+# Sensors are looked up by hwmon name, never by hwmonN index.
+set -u
+
+STATE=${THERMAL_GUARD_STATE:-/run/thermal-guard/state}
+
+# Nord palette
+C_NORMAL="#a3be8c" C_WARM="#ebcb8b" C_HOT="#d08770" C_CRIT="#bf616a" C_MUTED="#4c566a"
+
+# temp_of <hwmon name> [label] -> integer deg C, empty if unavailable
+temp_of() {
+    local dir name input label raw
+    for dir in /sys/class/hwmon/hwmon*; do
+        [[ -r $dir/name ]] || continue
+        read -r name <"$dir/name"
+        [[ $name == "$1" ]] || continue
+        for input in "$dir"/temp*_input; do
+            [[ -r $input ]] || continue
+            if [[ -n ${2:-} ]]; then
+                label=""
+                [[ -r ${input%_input}_label ]] && read -r label <"${input%_input}_label"
+                [[ $label == "$2" ]] || continue
+            fi
+            read -r raw <"$input" 2>/dev/null || continue
+            echo $((raw / 1000))
+            return 0
+        done
+    done
+    return 1
+}
+
+hwmon_dir() {
+    local dir name
+    for dir in /sys/class/hwmon/hwmon*; do
+        read -r name <"$dir/name" 2>/dev/null || continue
+        [[ $name == "$1" ]] && { echo "$dir"; return 0; }
+    done
+    return 1
+}
+
+state_get() { # state_get <key>
+    [[ -r $STATE ]] || return 1
+    local key val
+    while IFS='=' read -r key val; do
+        [[ $key == "$1" ]] && { echo "$val"; return 0; }
+    done <"$STATE"
+    return 1
+}
+
+bar_label() {
+    local t color icon guard level countdown
+    t=$(temp_of {{ .cpuSensor | default "k10temp" }} {{ if contains " " .cpuSensorLabel }}{{ .cpuSensorLabel | quote }}{{ else }}{{ .cpuSensorLabel | default "Tctl" }}{{ end }}) || { echo "%{F$C_MUTED}󰔏 --%{F-}"; return; }
+    if (( t >= 90 )); then color=$C_CRIT icon=$'\U000F10C2'
+    elif (( t >= 85 )); then color=$C_HOT icon=$'\U000F10C2'
+    elif (( t >= 75 )); then color=$C_WARM icon=$'\U000F050F'
+    else color=$C_NORMAL icon=$'\U000F050F'
+    fi
+    guard=""
+    level=$(state_get level) || level=0
+    case $level in
+        1) guard=" %{F$C_HOT}throttled%{F-}" ;;
+        2) guard=" %{F$C_CRIT}critical%{F-}" ;;
+        3) countdown=$(state_get countdown) || countdown="?"
+           guard=" %{F$C_CRIT}OFF in ${countdown}s%{F-}" ;;
+    esac
+    printf '%%{F%s}%s%%{F-} %s°C%s\n' "$color" "$icon" "$t" "$guard"
+}
+
+summary_lines() {
+    local cpu gpu nvme wifi gdir gpow="" f sum=0 n=0 max=0 cur mhz boost profile
+    cpu=$(temp_of {{ .cpuSensor | default "k10temp" }} {{ if contains " " .cpuSensorLabel }}{{ .cpuSensorLabel | quote }}{{ else }}{{ .cpuSensorLabel | default "Tctl" }}{{ end }}) || cpu="?"
+    gpu=$(temp_of amdgpu edge) || gpu="?"
+    nvme=$(temp_of nvme Composite) || nvme="?"
+    wifi=$(temp_of mt7921_phy0) || wifi="?"
+    if gdir=$(hwmon_dir amdgpu); then
+        for f in "$gdir"/power1_average "$gdir"/power1_input; do
+            [[ -r $f ]] && { read -r gpow <"$f"; gpow=" · APU package (PPT) $(awk -v p="$gpow" 'BEGIN{printf "%.1f W", p/1e6}')"; break; }
+        done
+    fi
+    for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq; do
+        read -r cur <"$f" || continue
+        sum=$((sum + cur)); n=$((n + 1)); (( cur > max )) && max=$cur
+    done
+    mhz="?"; (( n > 0 )) && mhz="avg $((sum / n / 1000)) MHz · max $((max / 1000)) MHz"
+    boost="?"; [[ -r /sys/devices/system/cpu/cpufreq/boost ]] && read -r boost </sys/devices/system/cpu/cpufreq/boost
+    [[ $boost == 1 ]] && boost=on; [[ $boost == 0 ]] && boost=off
+    profile=$(powerprofilesctl get 2>/dev/null || echo "?")
+
+    echo "CPU (Tctl):      ${cpu}°C"
+    echo "GPU (edge):      ${gpu}°C${gpow}"
+    echo "NVMe:            ${nvme}°C"
+    echo "Wi-Fi:           ${wifi}°C"
+    echo "CPU frequency:   ${mhz}"
+    echo "Power profile:   ${profile} · boost ${boost}"
+    if [[ -r $STATE ]]; then
+        echo "Thermal guard:   $(state_get name) (level $(state_get level))"
+        local r t st sl fa
+        r=$(state_get ryzenadj)
+        [[ $r =~ tctl-temp=([0-9]+) ]] && t=${BASH_REMATCH[1]}
+        [[ $r =~ stapm-limit=([0-9]+) ]] && st=$((BASH_REMATCH[1] / 1000))
+        [[ $r =~ slow-limit=([0-9]+) ]] && sl=$((BASH_REMATCH[1] / 1000))
+        [[ $r =~ fast-limit=([0-9]+) ]] && fa=$((BASH_REMATCH[1] / 1000))
+        echo "ryzenadj limits: $(state_get limits) · ${t:-?}°C · ${st:-?}/${sl:-?}/${fa:-?} W (stapm/slow/fast)"
+    else
+        echo "Thermal guard:   not running (sudo systemctl start thermal-guard)"
+    fi
+}
+
+open_monitor() {
+    exec ghostty --class=dev.gentleman.popup --window-width=0 --window-height=0 --title=btop -e btop
+}
+
+case ${1:-} in
+    --summary)
+        choice=$( { summary_lines; echo "󰄨  Open live monitor (btop)"; } |
+            rofi -dmenu -i -p "Temperatures" -no-custom -theme-str 'window {width: 44em;} listview {lines: 9;}') || exit 0
+        [[ $choice == *"Open live monitor"* ]] && open_monitor
+        ;;
+    --monitor) open_monitor ;;
+    --plain) summary_lines ;;
+    *) bar_label ;;
+esac

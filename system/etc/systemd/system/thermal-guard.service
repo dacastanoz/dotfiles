@@ -1,0 +1,22 @@
+[Unit]
+Description=Thermal guard: throttle, warn and power off on overheating
+Documentation=file:///usr/local/bin/thermal-guard
+After=power-profiles-daemon.service
+Wants=power-profiles-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thermal-guard
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+RuntimeDirectory=thermal-guard
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+Nice=-5
+OOMScoreAdjust=-900
+MemoryMax=64M
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Launch	Terminal: tmux main	Attach to the persistent tmux session "main"	launch	ghostty -e tmux new-session -A -s main
+Launch	Neovim (config)	Edit the Neovim config	launch	ghostty --title=nvim --working-directory=$HOME/.config/nvim -e nvim
+Tools	gga	Gentleman Guardian Angel (AI code review before commit)	copy
+Tools	nvim-project	Pick a project folder and open Neovim there	copy
+Tools	fzfnvim	Pick a file with fzf + bat preview and open it in Neovim	copy

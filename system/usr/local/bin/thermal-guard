@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# thermal-guard: last-line thermal protection for a laptop without ACPI thermal zones.
+#
+# Polls CPU (k10temp Tctl), GPU (amdgpu edge) and NVMe (Composite) temperatures, looked
+# up by hwmon *name* (never by hwmonN index), and escalates:
+#   level 1 "hot"      CPU/GPU >= 85 C for 20 s -> PPD power-saver + CPU boost off + notify
+#   level 2 "critical" CPU/GPU >= 90 C for 10 s -> also reduced ryzenadj limits + critical notify
+#   level 3 "shutdown" CPU/GPU >= 95 C for 10 s or NVMe >= 90 C for 10 s -> 30 s countdown
+#                      (persistent critical notification + wall + sound, updated every 10 s),
+#                      cancelled when CPU/GPU < 92 C and NVMe < 88 C; then `systemctl poweroff`.
+#   emergency          CPU/GPU >= 100 C during the countdown, or Tctl >= 100 C on two
+#                      consecutive samples at any time -> one notification, poweroff now.
+#   recovery           CPU/GPU < 75 C and NVMe < 80 C for 60 s -> restore previous PPD
+#                      profile, boost and ryzenadj limits.
+#
+# State for polybar/summary: $RUNDIR/state (key=value, world-readable).
+#
+# Test/dry-run environment:
+#   THERMAL_GUARD_DRYRUN=1         log actions instead of changing PPD/boost/limits/poweroff
+#   THERMAL_GUARD_FAKE=<file>      one "cpu gpu nvme" line (deg C) per tick; exit at EOF
+#   THERMAL_GUARD_INTERVAL=2       seconds of guard time per tick (all durations use it)
+#   THERMAL_GUARD_SLEEP=<sec>      real sleep per tick (default = interval; e.g. 0 in tests)
+#   THERMAL_GUARD_RUNDIR=<dir>     state dir (dry-run default /tmp/thermal-guard-dryrun)
+#   THERMAL_GUARD_NOTIFY=0|1       send desktop notifications (dry-run default 0: log only)
+#   THERMAL_GUARD_POWEROFF_CMD=... command used to power off (default: systemctl poweroff)
+set -u
+
+readonly T_HOT=85 T_CRIT=90 T_SHUT=95 T_NVME_SHUT=90 T_EMERG=100
+readonly T_CANCEL=92 T_NVME_CANCEL=88 T_COOL=75 T_NVME_COOL=80
+readonly HOT_SECS=20 CRIT_SECS=10 SHUT_SECS=10 COOL_SECS=60 COUNTDOWN_SECS=30 UPDATE_SECS=10
+
+DRYRUN=${THERMAL_GUARD_DRYRUN:-0}
+FAKE=${THERMAL_GUARD_FAKE:-}
+INTERVAL=${THERMAL_GUARD_INTERVAL:-2}
+SLEEP=${THERMAL_GUARD_SLEEP:-$INTERVAL}
+if [[ $DRYRUN == 1 ]]; then
+    RUNDIR=${THERMAL_GUARD_RUNDIR:-/tmp/thermal-guard-dryrun}
+    NOTIFY=${THERMAL_GUARD_NOTIFY:-0}
+else
+    RUNDIR=${THERMAL_GUARD_RUNDIR:-/run/thermal-guard}
+    NOTIFY=${THERMAL_GUARD_NOTIFY:-1}
+fi
+POWEROFF_CMD=${THERMAL_GUARD_POWEROFF_CMD:-systemctl poweroff}
+RYZENADJ_APPLY=${THERMAL_GUARD_RYZENADJ_APPLY:-/usr/local/bin/ryzenadj-apply}
+BOOST_FILE=/sys/devices/system/cpu/cpufreq/boost
+AC_ONLINE=/sys/class/power_supply/ACAD/online
+# battery-care (auto power profile) decides which profile fits the current AC state.
+BATTERY_CARE=${THERMAL_GUARD_BATTERY_CARE:-/usr/local/bin/battery-care}
+SOUND=/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga
+export THERMAL_GUARD_RUNDIR=$RUNDIR   # ryzenadj-apply reads the limits file from here
+
+RYZ_CACHE_KEY="" RYZ_CACHE=""
+LEVEL_NAMES=(normal hot critical shutdown poweroff)
+level=0
+hot_for=0 crit_for=0 shut_for=0 cool_for=0 emerg_count=0
+countdown=0 since_update=0 notif_id=""
+cpu=0 gpu=0 nvme=0
+declare -A SENSOR_PATH=()
+
+log() { printf '%s\n' "$*" >&2; }
+
+run() { # run a state-changing command, or only log it in dry-run
+    if [[ $DRYRUN == 1 ]]; then
+        log "DRYRUN would run: $*"
+        return 0
+    fi
+    "$@"
+}
+
+# --- sensors -----------------------------------------------------------------
+# find_temp <hwmon name> <label or empty = temp1> -> path of tempN_input
+find_temp() {
+    local want_name=$1 want_label=$2 dir name input label
+    for dir in /sys/class/hwmon/hwmon*; do
+        [[ -r $dir/name ]] || continue
+        read -r name <"$dir/name" || continue
+        [[ $name == "$want_name" ]] || continue
+        for input in "$dir"/temp*_input; do
+            [[ -r $input ]] || continue
+            if [[ -z $want_label ]]; then
+                printf '%s\n' "$input"; return 0
+            fi
+            label=""
+            [[ -r ${input%_input}_label ]] && read -r label <"${input%_input}_label"
+            if [[ $label == "$want_label" ]]; then
+                printf '%s\n' "$input"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# read_temp <key> <hwmon name> <label> -> integer deg C (0 when unavailable)
+read_temp() {
+    local key=$1 path=${SENSOR_PATH[$1]:-} raw
+    if [[ -z $path || ! -r $path ]]; then
+        path=$(find_temp "$2" "$3") || { echo 0; return; }
+        SENSOR_PATH[$key]=$path
+    fi
+    if ! read -r raw <"$path" 2>/dev/null || [[ ! $raw =~ ^-?[0-9]+$ ]]; then
+        SENSOR_PATH[$key]=""
+        echo 0; return
+    fi
+    raw=$((raw / 1000))
+    # Discard obviously bogus values (sensor glitches) instead of acting on them.
+    if (( raw < 1 || raw > 125 )); then echo 0; else echo "$raw"; fi
+}
+
+FAKE_FD=""
+read_sensors() {
+    if [[ -n $FAKE ]]; then
+        local line
+        while IFS= read -r line <&"$FAKE_FD"; do
+            [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+            read -r cpu gpu nvme <<<"$line"
+            return 0
+        done
+        return 1   # end of fake script
+    fi
+    cpu=$(read_temp cpu k10temp Tctl)
+    gpu=$(read_temp gpu amdgpu edge)
+    nvme=$(read_temp nvme nvme Composite)
+    return 0
+}
+
+# --- notifications (never fatal) -----------------------------------------------
+# notify <urgency> <title> <body> [replace-id]; prints the notification id (may be empty)
+notify() {
+    local urgency=$1 title=$2 body=$3 replace=${4:-} bus uid user icon=dialog-warning
+    local -a args
+    log "notify[$urgency]: $title - $body"
+    [[ $NOTIFY == 1 ]] || return 0
+    [[ $urgency == critical ]] && icon=dialog-error
+    args=(-a "Thermal guard" -u "$urgency" -i "$icon" -p)
+    [[ $urgency == critical ]] && args+=(-t 0)
+    [[ -n $replace ]] && args+=(-r "$replace")
+    for bus in /run/user/*/bus; do
+        [[ -S $bus ]] || continue
+        uid=${bus#/run/user/}; uid=${uid%/bus}
+        (( uid >= 1000 )) || continue
+        if [[ $EUID -eq 0 ]]; then
+            user=$(id -nu "$uid" 2>/dev/null) || continue
+            timeout 5 runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+                XDG_RUNTIME_DIR="/run/user/$uid" notify-send "${args[@]}" "$title" "$body" 2>/dev/null | head -n1
+        elif [[ $uid -eq $EUID ]]; then
+            timeout 5 env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+                notify-send "${args[@]}" "$title" "$body" 2>/dev/null | head -n1
+        fi
+    done
+    return 0
+}
+
+play_alarm() {
+    [[ $NOTIFY == 1 && -r $SOUND ]] || return 0
+    local bus uid user
+    for bus in /run/user/*/bus; do
+        [[ -S $bus ]] || continue
+        uid=${bus#/run/user/}; uid=${uid%/bus}
+        (( uid >= 1000 )) || continue
+        if [[ $EUID -eq 0 ]]; then
+            user=$(id -nu "$uid" 2>/dev/null) || continue
+            timeout 10 runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" paplay "$SOUND" >/dev/null 2>&1 &
+        elif [[ $uid -eq $EUID ]]; then
+            timeout 10 paplay "$SOUND" >/dev/null 2>&1 &
+        fi
+    done
+    return 0
+}
+
+wall_msg() {
+    log "wall: $1"
+    [[ $DRYRUN == 1 ]] && return 0
+    timeout 5 /usr/bin/wall "$1" 2>/dev/null || true
+}
+
+# --- mitigations ---------------------------------------------------------------
+SAVED=$RUNDIR/saved
+LIMITS=$RUNDIR/limits
+
+current_profile() { powerprofilesctl get 2>/dev/null || echo balanced; }
+
+apply_hot() {
+    local prev_profile prev_boost=1 prev_ac=1
+    if [[ ! -e $SAVED ]]; then
+        prev_profile=$(current_profile)
+        [[ $prev_profile == power-saver ]] && prev_profile=balanced
+        [[ -r $BOOST_FILE ]] && read -r prev_boost <"$BOOST_FILE"
+        [[ -r $AC_ONLINE ]] && read -r prev_ac <"$AC_ONLINE"
+        printf 'profile=%s\nboost=%s\nac=%s\n' "$prev_profile" "$prev_boost" "$prev_ac" >"$SAVED"
+    fi
+    # Profile first, then boost off (PPD rewrites per-policy boost when switching).
+    run powerprofilesctl set power-saver || log "warning: could not set power-saver"
+    if [[ -w $BOOST_FILE || $DRYRUN == 1 ]]; then
+        if [[ $DRYRUN == 1 ]]; then log "DRYRUN would write 0 > $BOOST_FILE"
+        else echo 0 >"$BOOST_FILE" 2>/dev/null || log "warning: could not disable boost"; fi
+    fi
+}
+
+apply_critical() {
+    echo reduced >"$LIMITS"
+    run "$RYZENADJ_APPLY" || log "warning: ryzenadj-apply failed"
+}
+
+restore_all() {
+    local profile=balanced boost=1 saved_ac="" key val p
+    if [[ -r $SAVED ]]; then
+        while IFS='=' read -r key val; do
+            case $key in
+                profile) profile=$val ;;
+                boost) boost=$val ;;
+                ac) saved_ac=$val ;;
+            esac
+        done <"$SAVED"
+    fi
+    if [[ -e $LIMITS ]]; then
+        rm -f "$LIMITS"
+        run "$RYZENADJ_APPLY" || log "warning: ryzenadj-apply failed"
+    fi
+    if [[ -e $SAVED ]]; then
+        # Boost first: PPD fails to switch profiles (amd_pstate per-policy boost write
+        # returns EINVAL) while the global boost switch is still 0.
+        if [[ $DRYRUN == 1 ]]; then log "DRYRUN would write $boost > $BOOST_FILE"
+        else echo "$boost" >"$BOOST_FILE" 2>/dev/null || log "warning: could not restore boost"; fi
+        # AC plugged/unplugged while throttled: restore the profile for the current AC state.
+        if [[ -x $BATTERY_CARE ]] && p=$("$BATTERY_CARE" restore-profile "$profile" "$saved_ac" 2>/dev/null) && [[ -n $p ]]; then
+            [[ $p != "$profile" ]] && log "restore profile $profile -> $p (battery-care, AC state)"
+            profile=$p
+        fi
+        run powerprofilesctl set "$profile" || log "warning: could not restore profile $profile"
+        rm -f "$SAVED"
+    fi
+}
+
+# --- state file ------------------------------------------------------------------
+write_state() {
+    local limits=normal tmp=$RUNDIR/.state.$$
+    [[ -e $LIMITS ]] && limits=reduced
+    {
+        printf 'level=%s\nname=%s\n' "$level" "${LEVEL_NAMES[level]}"
+        printf 'cpu=%s\ngpu=%s\nnvme=%s\n' "$cpu" "$gpu" "$nvme"
+        if [[ $limits != "$RYZ_CACHE_KEY" ]]; then
+            RYZ_CACHE_KEY=$limits
+            RYZ_CACHE=$("$RYZENADJ_APPLY" --print 2>/dev/null)
+            RYZ_CACHE=${RYZ_CACHE#* }
+        fi
+        printf 'limits=%s\nryzenadj=%s\n' "$limits" "$RYZ_CACHE"
+        printf 'countdown=%s\nupdated=%s\n' "$countdown" "${EPOCHSECONDS:-0}"
+        if [[ -r $SAVED ]]; then sed 's/^/saved_/' "$SAVED"; fi
+    } >"$tmp" 2>/dev/null && chmod 0644 "$tmp" && mv -f "$tmp" "$RUNDIR/state"
+}
+
+set_level() {
+    local new=$1 why=$2
+    log "level ${LEVEL_NAMES[level]} -> ${LEVEL_NAMES[new]} ($why; cpu=${cpu} gpu=${gpu} nvme=${nvme})"
+    level=$new
+}
+
+poweroff_now() {
+    local why=$1
+    set_level 4 "$why"
+    write_state
+    wall_msg "Thermal guard: $why - powering off NOW"
+    notify critical "Overheating: powering off now" "$why" "$notif_id" >/dev/null
+    if [[ $DRYRUN == 1 ]]; then
+        log "DRYRUN would power off with: $POWEROFF_CMD"
+        exit 0
+    fi
+    sync
+    local -a cmd
+    read -ra cmd <<<"$POWEROFF_CMD"
+    "${cmd[@]}" || log "error: poweroff command failed"
+    # Keep monitoring if poweroff somehow failed.
+    level=3; countdown=0
+}
+
+temp_desc() { printf 'CPU %s°C, GPU %s°C, NVMe %s°C' "$cpu" "$gpu" "$nvme"; }
+
+cleanup() {
+    log "stopping: restoring settings"
+    (( level > 0 && level < 4 )) && restore_all
+    level=0; countdown=0; write_state
+    exit 0
+}
+
+# --- main loop -----------------------------------------------------------------------
+mkdir -p "$RUNDIR" && chmod 0755 "$RUNDIR"
+if [[ -n $FAKE ]]; then
+    exec {FAKE_FD}<"$FAKE" || { log "cannot open fake script $FAKE"; exit 1; }
+fi
+# A previous instance may have died while throttling: put settings back first.
+if [[ -e $SAVED || -e $LIMITS ]]; then
+    log "found state from a previous run: restoring settings"
+    restore_all
+fi
+trap cleanup TERM INT
+
+missing_warned=0
+log "thermal-guard started (dryrun=$DRYRUN interval=${INTERVAL}s rundir=$RUNDIR)"
+while read_sensors; do
+    cg=$(( cpu > gpu ? cpu : gpu ))
+    if (( cpu == 0 && missing_warned == 0 )); then
+        log "warning: CPU temperature (k10temp Tctl) not readable"; missing_warned=1
+    fi
+
+    (( cg >= T_HOT )) && hot_for=$((hot_for + INTERVAL)) || hot_for=0
+    (( cg >= T_CRIT )) && crit_for=$((crit_for + INTERVAL)) || crit_for=0
+    (( cg >= T_SHUT || nvme >= T_NVME_SHUT )) && shut_for=$((shut_for + INTERVAL)) || shut_for=0
+    (( cpu >= T_EMERG )) && emerg_count=$((emerg_count + 1)) || emerg_count=0
+    (( cg < T_COOL && nvme < T_NVME_COOL )) && cool_for=$((cool_for + INTERVAL)) || cool_for=0
+
+    if (( level == 3 )); then
+        if (( cg >= T_EMERG || nvme >= T_EMERG )); then
+            poweroff_now "emergency: $(temp_desc) during countdown"
+        elif (( cg < T_CANCEL && nvme < T_NVME_CANCEL )); then
+            countdown=0
+            set_level 2 "temperature dropped, shutdown cancelled"
+            notify critical "Shutdown cancelled" "Temperature dropped: $(temp_desc). Still throttled." "$notif_id" >/dev/null
+            notif_id=""
+        else
+            countdown=$((countdown - INTERVAL))
+            since_update=$((since_update + INTERVAL))
+            if (( countdown <= 0 )); then
+                poweroff_now "overheating: $(temp_desc) for ${COUNTDOWN_SECS}s after warning"
+            elif (( since_update >= UPDATE_SECS )); then
+                since_update=0
+                log "countdown: ${countdown}s left ($(temp_desc))"
+                id=$(notify critical "Overheating: shutting down in ${countdown} s" \
+                    "Save your work now. $(temp_desc)" "$notif_id")
+                [[ -n $id ]] && notif_id=$id
+            fi
+        fi
+    elif (( emerg_count >= 2 )); then
+        (( level < 2 )) && { apply_hot; apply_critical; }
+        poweroff_now "emergency: CPU Tctl ${cpu}°C (>= ${T_EMERG}°C)"
+    elif (( shut_for >= SHUT_SECS )); then
+        (( level < 1 )) && apply_hot
+        (( level < 2 )) && apply_critical
+        set_level 3 "shutdown countdown ${COUNTDOWN_SECS}s"
+        countdown=$COUNTDOWN_SECS since_update=0
+        wall_msg "Overheating: shutting down in ${COUNTDOWN_SECS} s - save your work ($(temp_desc))"
+        play_alarm
+        notif_id=$(notify critical "Overheating: shutting down in ${COUNTDOWN_SECS} s" \
+            "Save your work now. $(temp_desc). Cancelled automatically if it cools below ${T_CANCEL}°C.")
+    elif (( crit_for >= CRIT_SECS && level < 2 )); then
+        (( level < 1 )) && apply_hot
+        apply_critical
+        set_level 2 "CPU/GPU >= ${T_CRIT}°C for ${CRIT_SECS}s"
+        notify critical "Critical temperature" "$(temp_desc). Power limits lowered to 10 W, boost off, power-saver." >/dev/null
+    elif (( hot_for >= HOT_SECS && level < 1 )); then
+        apply_hot
+        set_level 1 "CPU/GPU >= ${T_HOT}°C for ${HOT_SECS}s"
+        notify normal "High temperature" "$(temp_desc). Switched to power-saver and disabled CPU boost." >/dev/null
+    elif (( level > 0 && cool_for >= COOL_SECS )); then
+        restore_all
+        set_level 0 "below ${T_COOL}°C for ${COOL_SECS}s, settings restored"
+        notify normal "Temperature back to normal" "$(temp_desc). Previous power settings restored." >/dev/null
+    fi
+
+    write_state
+    [[ $SLEEP != 0 ]] && sleep "$SLEEP"
+done
+log "fake temperature script finished"
+cleanup

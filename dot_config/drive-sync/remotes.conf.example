@@ -1,0 +1,13 @@
+# drive-sync remotes. Copy to ~/.config/drive-sync/remotes.conf (kept out of the repo)
+# after creating the rclone remotes with `rclone config`.
+#
+# One remote per line:  name|rclone-remote:|local folder|label
+#   name    short id used by `drive-sync NAME` and the status files
+#   remote  rclone remote (and optional path), e.g. gdrive: or gdrive:Work
+#   folder  local bisync folder (~ and $HOME are expanded); create it before the first run
+#   label   optional, shown in Thunar bookmarks and the shortcuts menu
+#
+# First run of each remote needs a baseline:  drive-sync --resync NAME
+#
+# my_drive|gdrive:|~/drive/my_drive|My Drive
+# shared|gdrive-shared:|~/drive/shared|Shared folder

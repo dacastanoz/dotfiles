@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Start the xob volume/brightness OSD once. Idempotent: safe on every i3 reload,
+# and restarts xob if it died. Writers send values to /tmp/xobpipe.
+pipe=/tmp/xobpipe
+[[ -p $pipe ]] || { rm -f "$pipe"; mkfifo "$pipe"; }
+pgrep -u "$UID" -x xob >/dev/null && exit 0
+pkill -u "$UID" -x -f "tail -f $pipe" 2>/dev/null
+setsid -f sh -c "tail -f $pipe | xob -t 2170" >/dev/null 2>&1

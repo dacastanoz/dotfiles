@@ -1,0 +1,20 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Monitor	btop	Full system monitor (CPU, memory, disks, processes)
+Monitor	sensors	All temperature sensors once
+Monitor	watch -n 2 sensors	Temperature sensors, refreshed every 2 s
+Thermal	journalctl -u thermal-guard -n 50	Last thermal guard actions
+Polybar	Right-click temperature	Summary of every sensor, power profile, boost and limits	copy
+Polybar	Click temperature	Open the live monitor (btop)	copy
+{{- if .hasBattery }}
+Battery	control-center battery	Battery menu: health, 80 % limit, profiles, calibration ($mod+Shift+b)	launch	~/.local/bin/control-center battery
+Battery	battery-status toggle-limit	Toggle the 80 % charge limit (Acer health mode)	launch	~/.local/bin/battery-status toggle-limit
+Battery	powerprofilesctl set power-saver	Power profile: power-saver (auto on battery)	launch	~/.local/bin/battery-status set-profile power-saver
+Battery	powerprofilesctl set balanced	Power profile: balanced (default on AC)	launch	~/.local/bin/battery-status set-profile balanced
+Battery	powerprofilesctl set performance	Power profile: performance	launch	~/.local/bin/battery-status set-profile performance
+Battery	battery-status history-popup	Battery health history chart (daily CSV)	launch	~/.local/bin/battery-status history-popup
+Battery	battery-status info	Battery summary: %, W, time, health, limit, profile
+Battery	journalctl -u battery-care -u battery-care-ac -n 30	Last charge-limit / auto-profile actions
+Polybar	Click battery / lock glyph	Battery menu (right-click: cycle power profile)	copy
+{{- end }}

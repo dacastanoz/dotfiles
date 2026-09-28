@@ -1,0 +1,23 @@
+#? Config file for btop (T19 thermal monitor; btop fills in any missing option with its default).
+color_theme = "nord"
+theme_background = False
+truecolor = True
+vim_keys = True
+rounded_corners = True
+graph_symbol = "braille"
+shown_boxes = "cpu mem net proc"
+update_ms = 1000
+proc_sorting = "cpu lazy"
+proc_tree = False
+cpu_graph_upper = "total"
+cpu_graph_lower = "total"
+cpu_single_graph = False
+show_uptime = True
+check_temp = True
+cpu_sensor = "{{ if .cpuSensor }}{{ .cpuSensor }}/{{ .cpuSensorLabel }}{{ else }}Auto{{ end }}"
+show_coretemp = True
+temp_scale = "celsius"
+show_cpu_freq = True
+show_battery = True
+selected_battery = "Auto"
+background_update = True

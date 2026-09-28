@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Autorandr
+Comment=Apply the saved display profile for the connected monitors (extend horizontally if unknown)
+Type=Application
+Exec=/usr/bin/autorandr --change --default horizontal
+X-GNOME-Autostart-Phase=Initialization

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Google Drive bisync every 10 minutes (and 2 min after login)
+
+[Timer]
+OnStartupSec=2min
+OnCalendar=*:0/10
+RandomizedDelaySec=60
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

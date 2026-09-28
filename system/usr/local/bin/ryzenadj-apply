@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Apply Ryzen SMU thermal/power limits (tuned on a 15 W Ryzen 7 5700U laptop; adjust for other APUs).
+# Used by ryzenadj.service (boot, every 60 s via ryzenadj.timer, after resume) and by
+# thermal-guard. When thermal-guard is at level "critical" it writes "reduced" to
+# /run/thermal-guard/limits and this script applies the lower limits instead, so the
+# periodic timer never undoes the guard's throttling.
+#
+# APU skin temperature (STT) is left at the firmware default (39 C): setting
+# --apu-skin-temp=45 would RAISE that limit and reduce throttling.
+set -u
+
+LIMITS_FILE=${THERMAL_GUARD_RUNDIR:-/run/thermal-guard}/limits
+
+# Normal: 15 W sustained, 20 W boost, CPU temperature target 80 C.
+normal=(--tctl-temp=80 --stapm-limit=15000 --slow-limit=15000 --fast-limit=20000)
+# Reduced (thermal-guard critical): 10 W sustained, 12 W boost, 75 C target.
+reduced=(--tctl-temp=75 --stapm-limit=10000 --slow-limit=10000 --fast-limit=12000)
+
+mode=normal
+if [[ -r $LIMITS_FILE ]] && [[ $(<"$LIMITS_FILE") == reduced ]]; then
+    mode=reduced
+fi
+
+if [[ $mode == reduced ]]; then
+    args=("${reduced[@]}")
+else
+    args=("${normal[@]}")
+fi
+
+if [[ ${1:-} == --print ]]; then
+    printf '%s %s\n' "$mode" "${args[*]}"
+    exit 0
+fi
+
+exec /usr/bin/ryzenadj "${args[@]}"

@@ -1,0 +1,289 @@
+;==========================================================
+;  Polybar - Nord theme (i3, multi-monitor)
+;  Launched by ~/.config/polybar/launch.sh (bar name: example)
+;  Font: JetBrainsMono Nerd Font (glyphs are Material Design icons)
+;==========================================================
+
+[colors]
+bg       = #2e3440
+bg-alt   = #3b4252
+bg-sel   = #434c5e
+muted    = #4c566a
+fg       = #d8dee9
+fg-hi    = #eceff4
+frost    = #88c0d0
+blue     = #81a1c1
+green    = #a3be8c
+yellow   = #ebcb8b
+orange   = #d08770
+red      = #bf616a
+purple   = #b48ead
+
+[bar/example]
+monitor = ${env:MONITOR:}
+width = 100%
+height = ${env:POLYBAR_HEIGHT:24}
+dpi = ${env:POLYBAR_DPI:96}
+radius = 0
+fixed-center = true
+top = true
+override-redirect = false
+
+background = ${colors.bg}
+foreground = ${colors.fg}
+
+line-size = 2
+line-color = ${colors.frost}
+
+padding-left = 0
+padding-right = 1
+module-margin = 1
+
+separator = "%{F#4c566a}|%{F-}"
+
+font-0 = "JetBrainsMono Nerd Font:size=9;2"
+font-1 = "JetBrainsMono Nerd Font:size=11;3"
+font-2 = "JetBrainsMono Nerd Font:style=Bold:size=9;2"
+
+modules-left = launcher i3 cpu temperature memory
+modules-center = date
+; The system tray lives only on this (primary) bar: X11 allows a single tray.
+modules-right = updates drive-sync airplane pulseaudio{{ if .hasWifi }} network{{ end }}{{ if .hasBluetooth }} bluetooth{{ end }}{{ if .hasBattery }} battery battery-care{{ end }} shortcuts control power tray
+
+enable-ipc = true
+cursor-click = pointer
+cursor-scroll = ns-resize
+
+; Bar for secondary monitors: identical but without the tray.
+[bar/example-secondary]
+inherit = bar/example
+modules-right = updates drive-sync airplane pulseaudio{{ if .hasWifi }} network{{ end }}{{ if .hasBluetooth }} bluetooth{{ end }}{{ if .hasBattery }} battery battery-care{{ end }} shortcuts control power
+
+[settings]
+screenchange-reload = true
+pseudo-transparency = false
+
+[global/wm]
+margin-top = 0
+margin-bottom = 0
+
+; ---------------------------------------------------------- left
+[module/launcher]
+type = custom/text
+format = <label>
+label = "  "
+label-font = 2
+label-foreground = ${colors.bg}
+label-background = ${colors.frost}
+click-left = ~/.local/bin/rofi-launcher &
+click-right = ~/.local/bin/control-center &
+
+[module/i3]
+type = internal/i3
+format = <label-state> <label-mode>
+index-sort = true
+pin-workspaces = true
+enable-click = true
+enable-scroll = false
+wrapping-scroll = false
+
+label-mode = %mode%
+label-mode-padding = 1
+label-mode-background = ${colors.orange}
+label-mode-foreground = ${colors.bg}
+
+label-focused = %index%
+label-focused-background = ${colors.bg-sel}
+label-focused-foreground = ${colors.fg-hi}
+label-focused-underline = ${colors.frost}
+label-focused-padding = 1
+
+label-unfocused = %index%
+label-unfocused-foreground = ${colors.muted}
+label-unfocused-padding = 1
+
+label-visible = %index%
+label-visible-underline = ${colors.muted}
+label-visible-padding = 1
+
+label-urgent = %index%
+label-urgent-background = ${colors.red}
+label-urgent-foreground = ${colors.bg}
+label-urgent-padding = 1
+
+[module/cpu]
+type = internal/cpu
+interval = 2
+format-prefix = "󰻠 "
+format-prefix-foreground = ${colors.frost}
+label = %percentage:2%%
+
+[module/temperature]
+; CPU temperature (k10temp Tctl by hwmon name) + thermal-guard state (T19).
+; Click: live monitor (btop popup); right-click: rofi summary of all sensors.
+type = custom/script
+exec = ~/.config/polybar/scripts/temperature.sh
+interval = 3
+click-left = ~/.config/polybar/scripts/temperature.sh --monitor &
+click-right = ~/.config/polybar/scripts/temperature.sh --summary &
+
+[module/memory]
+type = internal/memory
+interval = 3
+format-prefix = "󰍛 "
+format-prefix-foreground = ${colors.frost}
+label = %gb_used%
+
+; ---------------------------------------------------------- center
+[module/date]
+type = internal/date
+interval = 5
+date = "%a %d %b"
+time = "%I:%M %p"
+date-alt = "%A %d %B %Y"
+time-alt = "%H:%M:%S"
+format-prefix = "󰥔 "
+format-prefix-foreground = ${colors.frost}
+label = %date%  %time%
+label-foreground = ${colors.fg-hi}
+
+; ---------------------------------------------------------- right
+[module/updates]
+type = custom/script
+exec = ~/.config/polybar/scripts/arch_updates.sh
+; checkupdates/paru hit the network: poll every 30 min
+interval = 1800
+format-prefix = "󰏖 "
+format-prefix-foreground = ${colors.frost}
+label = %output%
+click-left = ghostty -e paru &
+
+[module/airplane]
+type = custom/script
+exec = ~/.config/polybar/scripts/airplane.sh
+interval = 3
+click-left = ~/.local/bin/control-center airplane &
+
+; Left click: mixer, right click: mute, middle click: output picker, scroll: volume
+[module/pulseaudio]
+type = internal/pulseaudio
+use-ui-max = false
+interval = 5
+format-volume = %{A1:pavucontrol &:}<ramp-volume> <label-volume>%{A}
+label-volume = %percentage%%
+ramp-volume-0 = 󰕿
+ramp-volume-1 = 󰖀
+ramp-volume-2 = 󰕾
+ramp-volume-foreground = ${colors.frost}
+format-muted = %{A1:pavucontrol &:}<label-muted>%{A}
+label-muted = 󰝟 muted
+label-muted-foreground = ${colors.muted}
+click-right = pamixer -t
+click-middle = ~/.local/bin/control-center audio &
+
+; Left click: Wi-Fi picker, middle click: connection details, right click: connection editor
+[module/network]
+type = internal/network
+; No fixed interface name: polybar picks the first wireless interface (survives renames like wlan0 -> wlp*).
+interface-type = wireless
+interval = 3
+format-connected = %{A1:~/.local/bin/control-center wifi &:}%{A2:~/.local/bin/control-center details &:}%{A3:nm-connection-editor &:}<ramp-signal> <label-connected>%{A}%{A}%{A}
+label-connected = %essid% %signal%%
+label-connected-maxlen = 22
+ramp-signal-0 = 󰤟
+ramp-signal-1 = 󰤢
+ramp-signal-2 = 󰤥
+ramp-signal-3 = 󰤨
+ramp-signal-4 = 󰤨
+ramp-signal-foreground = ${colors.frost}
+format-disconnected = %{A1:~/.local/bin/control-center wifi &:}%{A2:~/.local/bin/control-center details &:}%{A3:nm-connection-editor &:}<label-disconnected>%{A}%{A}%{A}
+label-disconnected = 󰤭 offline
+label-disconnected-foreground = ${colors.muted}
+
+; Left click: Bluetooth manager, right click: power toggle
+[module/bluetooth]
+type = custom/script
+exec = ~/.config/polybar/scripts/bluetooth.sh
+interval = 5
+click-left = blueman-manager &
+click-right = ~/.config/polybar/scripts/bluetooth.sh toggle
+click-middle = ~/.local/bin/control-center bluetooth &
+
+[module/battery]
+type = internal/battery
+battery = {{ .batteryName | default "BAT0" }}
+adapter = {{ .adapterName | default "AC" }}
+full-at = 99
+low-at = 15
+poll-interval = 5
+time-format = %H:%M
+format-charging = "%{A1:~/.local/bin/control-center battery &:}%{A3:~/.local/bin/battery-status cycle-profile &:}<label-charging>%{A}%{A}"
+format-charging-prefix = "󰂄 "
+format-charging-prefix-foreground = ${colors.green}
+label-charging = %percentage%%
+format-discharging = "%{A1:~/.local/bin/control-center battery &:}%{A3:~/.local/bin/battery-status cycle-profile &:}<ramp-capacity> <label-discharging>%{A}%{A}"
+label-discharging = %percentage%%
+format-full = "%{A1:~/.local/bin/control-center battery &:}%{A3:~/.local/bin/battery-status cycle-profile &:}<label-full>%{A}%{A}"
+format-full-prefix = "󰂅 "
+format-full-prefix-foreground = ${colors.green}
+label-full = full
+format-low = "%{A1:~/.local/bin/control-center battery &:}%{A3:~/.local/bin/battery-status cycle-profile &:}<ramp-capacity> <label-low>%{A}%{A}"
+label-low = %percentage%% %time%
+label-low-foreground = ${colors.red}
+ramp-capacity-0 = 󰁺
+ramp-capacity-0-foreground = ${colors.red}
+ramp-capacity-1 = 󰁼
+ramp-capacity-1-foreground = ${colors.yellow}
+ramp-capacity-2 = 󰁾
+ramp-capacity-3 = 󰂀
+ramp-capacity-4 = 󰁹
+ramp-capacity-foreground = ${colors.frost}
+; left-click: control-center battery; right-click: cycle power profile (action tags above)
+
+; Charge-limit lock (80) / calibration + power-profile glyph (+ health only when < 60 %).
+; Tail script: one sleeping bash, redraws every 15 s or at once on SIGUSR1
+; (battery-status refresh, sent after profile / limit changes).
+[module/battery-care]
+type = custom/script
+exec = ~/.local/bin/battery-status polybar-tail
+tail = true
+click-left = ~/.local/bin/control-center battery &
+click-right = ~/.local/bin/battery-status cycle-profile &
+
+[module/shortcuts]
+; Shortcuts / help menu (rofi): every i3/ghostty/tmux/nvim key and useful commands.
+type = custom/text
+format = <label>
+label = "󰌌"
+label-font = 2
+label-foreground = ${colors.yellow}
+click-left = ~/.local/bin/shortcuts-menu &
+
+[module/control]
+type = custom/text
+format = <label>
+label = "󰒓"
+label-font = 2
+label-foreground = ${colors.frost}
+click-left = ~/.local/bin/control-center &
+
+[module/power]
+type = custom/text
+format = <label>
+label = "󰐥"
+label-font = 2
+label-foreground = ${colors.red}
+click-left = ~/.local/bin/rofi-powermenu &
+
+[module/tray]
+type = internal/tray
+tray-size = 60%
+tray-spacing = 6px
+tray-background = ${colors.bg}
+
+; Google Drive sync status (rclone bisync); click for actions
+[module/drive-sync]
+type = custom/script
+exec = ~/.local/bin/drive-sync-status
+interval = 15
+click-left = ~/.local/bin/drive-sync-status --click &

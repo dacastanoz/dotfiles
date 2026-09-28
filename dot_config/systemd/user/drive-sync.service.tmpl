@@ -1,0 +1,18 @@
+[Unit]
+Description=Bidirectional sync of Google Drive with rclone bisync
+Documentation=file://{{ .chezmoi.homeDir }}/.local/bin/drive-sync
+# User managers cannot order against the system network-online.target;
+# the script itself checks connectivity and skips gracefully when offline.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/drive-sync
+Environment=DRIVE_SYNC_TIMER=1
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+MemoryHigh=500M
+TimeoutStartSec=45min
+# A killed run leaves a bisync lock; --max-lock 2m + --recover handle it next time.
+KillMode=mixed

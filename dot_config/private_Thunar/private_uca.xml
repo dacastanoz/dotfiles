@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<actions>
+<action>
+	<icon>utilities-terminal</icon>
+	<name>Open Terminal Here</name>
+	<submenu></submenu>
+	<unique-id>1779285020791297-1</unique-id>
+	<command>ghostty --working-directory=%f</command>
+	<description>Open ghostty in this folder</description>
+	<range></range>
+	<patterns>*</patterns>
+	<startup-notify/>
+	<directories/>
+</action>
+<action>
+	<icon>com.visualstudio.code</icon>
+	<name>Open in VS Code</name>
+	<submenu></submenu>
+	<unique-id>1779285020791297-2</unique-id>
+	<command>code %F</command>
+	<description>Open the selected files or folder in Visual Studio Code</description>
+	<range></range>
+	<patterns>*</patterns>
+	<directories/>
+	<text-files/>
+	<other-files/>
+</action>
+<action>
+	<icon>nvim</icon>
+	<name>Open in Neovim</name>
+	<submenu></submenu>
+	<unique-id>1779285020791297-3</unique-id>
+	<command>ghostty --working-directory=%d -e nvim %F</command>
+	<description>Open the selection in Neovim inside ghostty</description>
+	<range></range>
+	<patterns>*</patterns>
+	<directories/>
+	<text-files/>
+	<other-files/>
+</action>
+<action>
+	<icon>edit-copy</icon>
+	<name>Copy Path</name>
+	<submenu></submenu>
+	<unique-id>1779285020791297-4</unique-id>
+	<command>sh -c 'echo -n "$1" | xclip -selection clipboard &amp;&amp; notify-send -i edit-copy "Path copied" "$1"' _ %f</command>
+	<description>Copy the full path to the clipboard</description>
+	<range></range>
+	<patterns>*</patterns>
+	<directories/>
+	<audio-files/>
+	<image-files/>
+	<other-files/>
+	<text-files/>
+	<video-files/>
+</action>
+<action>
+	<icon>document-send</icon>
+	<name>Drag and Drop (dragon)</name>
+	<submenu></submenu>
+	<unique-id>1779285020791297-5</unique-id>
+	<command>dragon-drop --and-exit %F</command>
+	<description>Show a small drag source window for the selection (for browsers/chat apps)</description>
+	<range></range>
+	<patterns>*</patterns>
+	<audio-files/>
+	<image-files/>
+	<other-files/>
+	<text-files/>
+	<video-files/>
+</action>
+</actions>

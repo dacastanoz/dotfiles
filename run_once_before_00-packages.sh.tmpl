@@ -1,0 +1,98 @@
+#!/bin/bash
+# Install the packages this desktop needs (idempotent: only missing packages are installed).
+# Re-runs automatically when a package list changes:
+#   pacman.txt {{ include "packages/pacman.txt" | sha256sum }}
+#   aur.txt    {{ include "packages/aur.txt" | sha256sum }}
+#   brew.txt   {{ include "packages/brew.txt" | sha256sum }}
+set -euo pipefail
+
+SRC={{ .chezmoi.sourceDir | quote }}
+
+say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+
+if ! command -v pacman >/dev/null 2>&1; then
+    warn "pacman not found: this repo targets CachyOS/Arch. Skipping package installation."
+    exit 0
+fi
+
+# Package names from a list file: strip comments and blank lines.
+read_list() { sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$1"; }
+
+# Keep only packages that are not installed yet.
+missing() { local p; for p in "$@"; do pacman -Qq "$p" >/dev/null 2>&1 || printf '%s\n' "$p"; done; }
+
+mapfile -t repo_pkgs < <(read_list "$SRC/packages/pacman.txt")
+mapfile -t aur_pkgs < <(read_list "$SRC/packages/aur.txt")
+
+# Hardware-specific packages (detected by .chezmoi.toml.tmpl).
+{{- if .hasBluetooth }}
+repo_pkgs+=(blueman bluez bluez-utils)
+{{- end }}
+{{- if .isAMDLaptop }}
+aur_pkgs+=(ryzenadj)
+{{- end }}
+{{- if .isAcerLaptop }}
+aur_pkgs+=(acer-wmi-battery-dkms)
+# DKMS needs the headers of every installed CachyOS/Arch kernel.
+while read -r kernel; do
+    if pacman -Si "$kernel-headers" >/dev/null 2>&1; then repo_pkgs+=("$kernel-headers"); fi
+done < <(pacman -Qq | grep -E '^linux(-cachyos)?(-[a-z0-9]+)?$' | grep -v -- '-headers$' || true)
+{{- end }}
+
+mapfile -t need_repo < <(missing "${repo_pkgs[@]}")
+mapfile -t need_aur < <(missing "${aur_pkgs[@]}")
+
+if [ "${#need_repo[@]}" -gt 0 ] || [ "${#need_aur[@]}" -gt 0 ]; then
+    say "sudo is needed to install packages"
+    sudo -v
+fi
+
+if [ "${#need_repo[@]}" -gt 0 ]; then
+    # Skip names the configured repositories do not know (e.g. CachyOS-only packages on Arch).
+    available=()
+    for p in "${need_repo[@]}"; do
+        if pacman -Si "$p" >/dev/null 2>&1; then available+=("$p"); else warn "not in repos, skipped: $p"; fi
+    done
+    if [ "${#available[@]}" -gt 0 ]; then
+        say "pacman: installing ${#available[@]} package(s)"
+        sudo pacman -S --needed --noconfirm "${available[@]}"
+    fi
+else
+    say "pacman: all repository packages already installed"
+fi
+
+if [ "${#need_aur[@]}" -gt 0 ]; then
+    if ! command -v paru >/dev/null 2>&1; then
+        if pacman -Si paru >/dev/null 2>&1; then
+            say "installing paru (CachyOS repository)"
+            sudo pacman -S --needed --noconfirm paru
+        else
+            warn "paru is not available; install an AUR helper and re-run: ${need_aur[*]}"
+        fi
+    fi
+    if command -v paru >/dev/null 2>&1; then
+        say "paru: installing ${#need_aur[@]} AUR package(s): ${need_aur[*]}"
+        paru -S --needed --noconfirm --skipreview "${need_aur[@]}" || warn "some AUR packages failed; re-run 'chezmoi apply' later"
+    fi
+else
+    say "AUR: all packages already installed"
+fi
+
+brew_bin=$(command -v brew || true)
+[ -n "$brew_bin" ] || { [ -x /home/linuxbrew/.linuxbrew/bin/brew ] && brew_bin=/home/linuxbrew/.linuxbrew/bin/brew; } || true
+if [ -n "$brew_bin" ]; then
+    mapfile -t brew_pkgs < <(read_list "$SRC/packages/brew.txt")
+    need_brew=()
+    for p in "${brew_pkgs[@]}"; do
+        "$brew_bin" list --formula "$p" >/dev/null 2>&1 || need_brew+=("$p")
+    done
+    if [ "${#need_brew[@]}" -gt 0 ]; then
+        say "brew: installing ${need_brew[*]}"
+        "$brew_bin" install "${need_brew[@]}" || warn "some brew formulae failed"
+    fi
+else
+    say "brew not found: skipping packages/brew.txt (install Gentleman.Dots or Homebrew first if you want them)"
+fi
+
+say "packages done"

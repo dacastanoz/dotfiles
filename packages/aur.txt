@@ -1,0 +1,8 @@
+# AUR packages (installed with paru). Hardware-specific AUR packages are added by
+# run_once_before_00-packages.sh only where they apply (ryzenadj, acer-wmi-battery-dkms).
+xidlehook
+dragon-drop
+papirus-folders
+# Notion app window (notion.desktop) and default editor for text/code (mimeapps.list)
+google-chrome
+visual-studio-code-bin

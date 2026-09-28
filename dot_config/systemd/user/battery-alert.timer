@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the battery level every 60 s for low-battery notifications
+
+[Timer]
+OnStartupSec=1min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

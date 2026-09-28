@@ -1,0 +1,78 @@
+#!/bin/bash
+# Display toggle script - cycles through modes like Windows+P
+# Modes: laptop-only → extend-right → mirror → tv-only → laptop-only
+
+# Laptop panel name is detected (eDP, eDP-1, LVDS-1, ...) instead of hardcoded.
+INTERNAL=$(xrandr --query | awk '/ connected/ && $1 ~ /^(eDP|LVDS|DSI)/ {print $1; exit}')
+INTERNAL=${INTERNAL:-eDP}
+EXTERNAL=$(xrandr --query | awk -v i="$INTERNAL" '/ connected/ && $1 != i {print $1; exit}')
+
+if [ -z "$EXTERNAL" ]; then
+    notify-send "Display" "No external display detected" -i video-display
+    exit 0
+fi
+
+# Detect current mode
+internal_active=$(xrandr | grep "^$INTERNAL " | grep -oP '\d+x\d+\+\d+\+\d+')
+external_active=$(xrandr | grep "^$EXTERNAL " | grep -oP '\d+x\d+\+\d+\+\d+')
+
+# Audio card that carries HDMI/DisplayPort outputs (detected, e.g. alsa_card.pci-0000_03_00.1).
+hdmi_card() {
+    pactl list cards 2>/dev/null | awk '
+        /^[[:space:]]*Name: /{name=$2}
+        /hdmi-output|HDMI|DisplayPort/ && name {print name; exit}'
+}
+
+switch_audio_hdmi() {
+    HDMI_CARD=$(hdmi_card)
+    [ -n "$HDMI_CARD" ] || return 0
+    pactl set-card-profile "$HDMI_CARD" HiFi 2>/dev/null
+    sleep 0.3
+    HDMI_SINK=$(pactl list sinks short | grep -i "hdmi\|displayport" | awk '{print $2}' | head -1)
+    [ -n "$HDMI_SINK" ] && pactl set-default-sink "$HDMI_SINK"
+}
+
+switch_audio_speaker() {
+    HDMI_CARD=$(hdmi_card)
+    [ -n "$HDMI_CARD" ] && pactl set-card-profile "$HDMI_CARD" off 2>/dev/null
+    SPEAKER_SINK=$(pactl list sinks short | awk '$2 ~ /^alsa_output\./ && tolower($2) !~ /hdmi|displayport/ {print $2; exit}')
+    [ -n "$SPEAKER_SINK" ] && pactl set-default-sink "$SPEAKER_SINK"
+}
+
+if [ -z "$external_active" ]; then
+    # Mode: laptop only → extend right
+    xrandr --output "$INTERNAL" --mode 1920x1080 --primary \
+           --output "$EXTERNAL" --auto --right-of "$INTERNAL"
+    switch_audio_hdmi
+    notify-send "Display" "Extended → right" -i video-display
+
+elif [ -n "$internal_active" ] && [ -n "$external_active" ]; then
+    int_pos=$(echo "$internal_active" | grep -oP '\+\d+\+\d+$')
+    ext_pos=$(echo "$external_active" | grep -oP '\+\d+\+\d+$')
+
+    if [ "$int_pos" = "$ext_pos" ]; then
+        # Mode: mirror → TV only
+        xrandr --output "$INTERNAL" --off \
+               --output "$EXTERNAL" --auto --primary
+        switch_audio_hdmi
+        notify-send "Display" "TV only" -i video-display
+    else
+        # Mode: extend → mirror (force 1080p on both)
+        xrandr --output "$INTERNAL" --mode 1920x1080 --primary \
+               --output "$EXTERNAL" --mode 1920x1080 --same-as "$INTERNAL"
+        switch_audio_hdmi
+        notify-send "Display" "Mirror (1080p)" -i video-display
+    fi
+else
+    # Mode: TV only → laptop only
+    xrandr --output "$EXTERNAL" --off \
+           --output "$INTERNAL" --auto --primary
+    switch_audio_speaker
+    notify-send "Display" "Laptop only" -i video-display
+fi
+
+# Redraw bars (one per active monitor, tray on the primary) and the wallpaper.
+# autorandr does not fire for manual xrandr changes, so relaunch here.
+"$HOME/.config/polybar/launch.sh" >/dev/null 2>&1 &
+[ -f "$HOME/.config/i3/wallpaper.png" ] && feh --no-fehbg --bg-fill "$HOME/.config/i3/wallpaper.png"
+exit 0

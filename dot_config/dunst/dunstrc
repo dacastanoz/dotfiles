@@ -1,0 +1,86 @@
+# Dunst - Nord theme (dunst >= 1.9 syntax). Backup: dunstrc.bak-20260928
+# Control with dunstctl (bound in i3): close, close-all, history-pop.
+
+[global]
+    monitor = 0
+    follow = keyboard
+
+    # Geometry: top-right, below polybar
+    width = (240, 360)
+    height = (0, 180)
+    origin = top-right
+    offset = (12, 36)
+    notification_limit = 5
+    indicate_hidden = yes
+
+    # Progress bar (e.g. volume hints)
+    progress_bar = true
+    progress_bar_height = 8
+    progress_bar_frame_width = 0
+    progress_bar_corner_radius = 4
+    highlight = "#88c0d0"
+
+    # Look
+    font = JetBrainsMono Nerd Font 9
+    corner_radius = 8
+    frame_width = 2
+    frame_color = "#4c566a"
+    separator_height = 1
+    separator_color = frame
+    gap_size = 6
+    padding = 10
+    horizontal_padding = 12
+    text_icon_padding = 10
+    transparency = 0
+    line_height = 0
+
+    markup = full
+    format = "<b>%s</b>\n%b"
+    alignment = left
+    vertical_alignment = center
+    word_wrap = yes
+    ellipsize = middle
+    ignore_newline = no
+    show_age_threshold = 60
+    stack_duplicates = true
+    hide_duplicate_count = false
+    show_indicators = no
+    sort = yes
+    idle_threshold = 120
+
+    # Icons (Papirus)
+    enable_recursive_icon_lookup = true
+    icon_theme = Papirus-Dark
+    icon_position = left
+    min_icon_size = 24
+    max_icon_size = 40
+
+    sticky_history = yes
+    history_length = 30
+    dmenu = /usr/bin/rofi -dmenu -p dunst
+    browser = /usr/bin/xdg-open
+    always_run_script = true
+    title = Dunst
+    class = Dunst
+
+    mouse_left_click = do_action, close_current
+    mouse_middle_click = close_all
+    mouse_right_click = close_current
+
+[urgency_low]
+    background = "#2e3440"
+    foreground = "#d8dee9"
+    frame_color = "#4c566a"
+    timeout = 5
+
+[urgency_normal]
+    background = "#2e3440"
+    foreground = "#eceff4"
+    frame_color = "#88c0d0"
+    timeout = 8
+
+[urgency_critical]
+    background = "#3b4252"
+    foreground = "#eceff4"
+    frame_color = "#bf616a"
+    timeout = 0

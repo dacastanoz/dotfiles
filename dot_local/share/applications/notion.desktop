@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Notion
+GenericName=Notes and Docs
+Comment=Notion in a lightweight Google Chrome app window
+Exec=google-chrome-stable --app=https://www.notion.so --class=Notion %U
+Icon=notion
+Terminal=false
+Categories=Office;
+Keywords=notes;wiki;docs;
+StartupWMClass=www.notion.so

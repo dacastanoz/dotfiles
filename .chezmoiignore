@@ -1,0 +1,23 @@
+# Repo-only files (never copied into $HOME)
+README.md
+LICENSE
+docs/
+packages/
+system/
+
+# Machine-specific or secret data that must never be managed here
+.config/rclone/rclone.conf
+.config/drive-sync/remotes.conf
+.config/autorandr/*/
+**/*.bak*
+**/*.log
+
+# Hardware-dependent files
+{{- if not .hasBattery }}
+.local/bin/battery-status
+.config/systemd/user/battery-*
+{{- end }}
+{{- if not .hasBluetooth }}
+.config/wireplumber/wireplumber.conf.d/51-bluez-default-sink.conf
+.config/polybar/scripts/bluetooth.sh
+{{- end }}

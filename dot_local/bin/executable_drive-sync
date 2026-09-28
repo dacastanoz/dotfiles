@@ -1,0 +1,311 @@
+#!/bin/bash
+# drive-sync: hardened rclone bisync of Google Drive remotes into local folders.
+#
+# Remotes are machine-local and NOT part of the dotfiles repo. Configure them in
+#   ~/.config/drive-sync/remotes.conf   (see remotes.conf.example next to it)
+# one per line:  name|rclone-remote:|local folder|label   (label optional, ~ and $HOME allowed)
+# Without that file the script exits 0 and does nothing.
+#
+# Usage:
+#   drive-sync [TARGET]            normal bisync (TARGET: all or a name from remotes.conf)
+#   drive-sync --dry-run [TARGET]  show what would change, touch nothing
+#   drive-sync --force [TARGET]    bypass the --max-delete safety abort (after checking!)
+#   drive-sync --resync [TARGET]   rebuild bisync baseline (union copy, newer wins, no deletes)
+#
+# Behaviour:
+#   - Skips gracefully (exit 0, state=offline) when there is no network / airplane mode.
+#   - Skips timer runs when on battery below DRIVE_SYNC_MIN_BATTERY percent (default 10).
+#   - Never runs --resync on its own: when rclone says "Must run --resync" the remote is
+#     marked needs-resync and a desktop notification is sent. Use the polybar menu
+#     (drive-sync-status --click) or `drive-sync --resync <target>` to recover.
+#   - Per-remote status in ~/.local/state/drive-sync/<name>.status (read by drive-sync-status).
+#   - Full verbose log of the last run per remote: ~/.local/state/drive-sync/<name>.last.log
+#   - Summary log: ~/.local/share/rclone/bisync.log (rotated at 2 MiB, one gzip generation).
+#   - Files overwritten/deleted locally by a sync are kept 14 days in
+#     ~/.local/share/drive-sync/backup/<name>/<date>/ (remote side uses Drive's trash).
+
+set -u
+export LC_ALL=C.UTF-8
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus}"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drive-sync"
+LOGFILE="$HOME/.local/share/rclone/bisync.log"
+FILTERS="$HOME/.config/rclone/bisync-filters.txt"
+BACKUP_ROOT="$HOME/.local/share/drive-sync/backup"
+LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/drive-sync-${UID}.lock"
+LOG_MAX_BYTES=$((2 * 1024 * 1024))
+BACKUP_KEEP_DAYS=14
+RENOTIFY_SECONDS=$((6 * 3600))
+MIN_BATTERY="${DRIVE_SYNC_MIN_BATTERY:-10}"
+
+REMOTES_CONF="${DRIVE_SYNC_REMOTES:-${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync/remotes.conf}"
+
+# Load "name|remote|local dir" entries from remotes.conf (comments and blank lines ignored).
+REMOTES=()
+if [ -r "$REMOTES_CONF" ]; then
+    while IFS='|' read -r r_name r_remote r_dir _; do
+        case "$r_name" in ''|'#'*) continue ;; esac
+        [ -n "$r_remote" ] && [ -n "$r_dir" ] || continue
+        case "$r_dir" in
+            \~) r_dir=$HOME ;;
+            \~/*) r_dir="$HOME/${r_dir#\~/}" ;;
+            \$HOME*) r_dir="$HOME${r_dir#\$HOME}" ;;
+        esac
+        REMOTES+=("$r_name|$r_remote|$r_dir")
+    done <"$REMOTES_CONF"
+fi
+if [ "${#REMOTES[@]}" -eq 0 ]; then
+    echo "drive-sync: no remotes configured in $REMOTES_CONF; nothing to do"
+    exit 0
+fi
+
+known_target() { # name -> 0 if it is configured
+    local entry
+    for entry in "${REMOTES[@]}"; do [ "${entry%%|*}" = "$1" ] && return 0; done
+    return 1
+}
+
+MODE=normal
+TARGET=all
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) MODE=dry-run ;;
+        --force) MODE=force ;;
+        --resync) MODE=resync ;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        all) TARGET=all ;;
+        -*) echo "Usage: drive-sync [--dry-run|--force|--resync] [all|NAME]" >&2; exit 2 ;;
+        *)
+            if known_target "$1"; then TARGET=$1
+            else echo "drive-sync: unknown remote '$1' (see $REMOTES_CONF)" >&2; exit 2; fi ;;
+    esac
+    shift
+done
+
+mkdir -p "$STATE_DIR" "$(dirname "$LOGFILE")" "$BACKUP_ROOT"
+
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "[$(date '+%F %T')] Sync already in progress; skipping this run"
+    exit 0
+fi
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOGFILE"; }
+
+notify() { # urgency title body
+    command -v notify-send >/dev/null 2>&1 || return 0
+    # Linger is on, so the timer can fire before anyone logs in to X: do not
+    # D-Bus-activate dunst without a display (it would fail and show as a failed unit).
+    pgrep -u "$(id -u)" -x dunst >/dev/null || pgrep -u "$(id -u)" -x i3 >/dev/null || return 0
+    notify-send -a "Drive sync" -u "$1" -i folder-cloud "$2" "$3" 2>/dev/null || true
+}
+
+rotate_log() {
+    local size
+    size=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$LOG_MAX_BYTES" ]; then
+        gzip -c "$LOGFILE" >"$LOGFILE.1.gz" && : >"$LOGFILE"
+    fi
+}
+
+# Read one key from a status file (key=value lines).
+status_get() { # file key
+    [ -f "$1" ] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [ "$k" = "$2" ] && { printf '%s' "$v"; return 0; }
+    done <"$1"
+}
+
+# Write status atomically. Keeps last_ok / notified_* unless overridden.
+write_status() { # name state message [last_ok]
+    local file="$STATE_DIR/$1.status" now last_ok notified_state notified_at
+    now=$(date +%s)
+    last_ok="${4:-$(status_get "$file" last_ok)}"
+    notified_state=$(status_get "$file" notified_state)
+    notified_at=$(status_get "$file" notified_at)
+    {
+        echo "state=$2"
+        echo "message=${3//$'\n'/ }"
+        echo "last_run=$now"
+        echo "last_ok=${last_ok:-0}"
+        echo "notified_state=${notified_state}"
+        echo "notified_at=${notified_at:-0}"
+    } >"$file.tmp" && mv -f "$file.tmp" "$file"
+}
+
+# Notify only on state transitions, or again after RENOTIFY_SECONDS.
+notify_once() { # name state urgency title body
+    local file="$STATE_DIR/$1.status" prev_state prev_at now
+    prev_state=$(status_get "$file" notified_state)
+    prev_at=$(status_get "$file" notified_at)
+    now=$(date +%s)
+    if [ "$prev_state" != "$2" ] || [ $((now - ${prev_at:-0})) -gt "$RENOTIFY_SECONDS" ]; then
+        notify "$3" "$4" "$5"
+        sd '^notified_state=.*$' "notified_state=$2" "$file" 2>/dev/null
+        sd '^notified_at=.*$' "notified_at=$now" "$file" 2>/dev/null
+    fi
+}
+
+clear_notified() { # name
+    local file="$STATE_DIR/$1.status"
+    [ -f "$file" ] || return 0
+    sd '^notified_state=.*$' 'notified_state=' "$file" 2>/dev/null
+}
+
+is_online() {
+    if command -v nmcli >/dev/null 2>&1; then
+        case "$(nmcli -t -f CONNECTIVITY general 2>/dev/null)" in
+            none) return 1 ;;
+        esac
+    fi
+    # Any HTTP answer (401 is expected without a token) means Google APIs are reachable.
+    local code
+    code=$(curl -s -o /dev/null --max-time 10 -w '%{http_code}' https://www.googleapis.com/drive/v3/about 2>/dev/null)
+    [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+battery_too_low() {
+    local bat status cap
+    for bat in /sys/class/power_supply/BAT*; do
+        [ -r "$bat/status" ] || continue
+        status=$(<"$bat/status")
+        cap=$(<"$bat/capacity")
+        [ "$status" = "Discharging" ] && [ "$cap" -lt "$MIN_BATTERY" ] && return 0
+    done
+    return 1
+}
+
+list_conflicts() { # local_dir
+    fd -H -t f --no-ignore 'conflict[0-9]+' "$1" 2>/dev/null | sort
+}
+
+sync_remote() { # name remote local_dir
+    local name="$1" remote="$2" local_dir="$3"
+    local runlog="$STATE_DIR/$name.last.log" backup_dir rc before after new_conflicts
+    backup_dir="$BACKUP_ROOT/$name/$(date +%F)"
+
+    if [ ! -d "$local_dir" ]; then
+        write_status "$name" error "Local folder missing: $local_dir"
+        notify_once "$name" error critical "Drive sync: $name" "Local folder missing: $local_dir"
+        log "✗ $name: local folder missing ($local_dir)"
+        return 1
+    fi
+
+    local args=(
+        "$remote" "$local_dir"
+        --filters-file "$FILTERS"
+        --check-access
+        --conflict-resolve newer
+        --conflict-loser num
+        --resilient
+        --recover
+        --max-lock 2m
+        --max-delete 30
+        --retries 3 --retries-sleep 10s
+        --low-level-retries 10
+        --contimeout 30s --timeout 5m
+        --color NEVER
+        -v
+    )
+    case "$MODE" in
+        dry-run) args+=(--dry-run) ;;
+        force) args+=(--force --backup-dir2 "$backup_dir") ;;
+        resync) args+=(--resync --resync-mode newer) ;;
+        normal) args+=(--backup-dir2 "$backup_dir") ;;
+    esac
+
+    log "Syncing $name ($MODE)..."
+    before=$(list_conflicts "$local_dir")
+    rclone bisync "${args[@]}" >"$runlog" 2>&1
+    rc=$?
+    # Keep the summary block plus every error/notice in the long-lived log.
+    rg -N '(ERROR|NOTICE|Transferred:|Errors:|Checks:|Elapsed time:)' "$runlog" \
+        | rg -v 'shared Google Drive client_id' | tail -n 40 >>"$LOGFILE"
+
+    if [ "$MODE" = dry-run ]; then
+        log "dry-run $name finished (exit $rc); full output: $runlog"
+        return "$rc"
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        after=$(list_conflicts "$local_dir")
+        new_conflicts=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | rg -c . || true)
+        write_status "$name" ok "Synced" "$(date +%s)"
+        clear_notified "$name"
+        if [ "${new_conflicts:-0}" -gt 0 ]; then
+            notify normal "Drive sync: $name conflicts" \
+                "$new_conflicts file(s) changed on both sides. Newer kept; older renamed *.conflictN in $local_dir"
+            log "⚠ $name: $new_conflicts new conflict file(s)"
+        fi
+        log "✓ $name synced successfully"
+        return 0
+    fi
+
+    # Classify the failure.
+    local state=error urgency=critical msg
+    if rg -qi 'must run --resync' "$runlog"; then
+        state=needs-resync
+        msg="Bisync baseline lost. Review, then use 'Resync' in the Drive menu."
+    elif rg -qi 'too many deletes|safety abort' "$runlog"; then
+        state=too-many-deletes
+        msg="Too many deletions detected; aborted for safety. Check, then run: drive-sync --force $name"
+    elif rg -qi 'invalid_grant|couldn.t fetch token|token expired|oauth2|unauthorized_client|401 Unauthorized' "$runlog"; then
+        state=auth
+        msg="Google auth expired. Run: rclone config reconnect $remote"
+    elif rg -qi 'network is unreachable|no such host|i/o timeout|connection refused|connection reset|TLS handshake timeout|dial tcp' "$runlog"; then
+        state=offline
+        urgency=low
+        msg="Network dropped during sync; will retry."
+    elif rg -qi 'rateLimitExceeded|userRateLimitExceeded|code 429|quotaExceeded' "$runlog"; then
+        state=rate-limited
+        urgency=low
+        msg="Google API rate limit; will retry next run."
+    elif rg -qi 'prior lock file found' "$runlog"; then
+        state=locked
+        urgency=low
+        msg="Stale bisync lock; expires automatically (--max-lock 2m)."
+    else
+        msg="$(rg -i 'error' "$runlog" | tail -n 1 | cut -c1-160)"
+        [ -n "$msg" ] || msg="rclone exit $rc"
+    fi
+    write_status "$name" "$state" "$msg"
+    case "$state" in
+        offline|rate-limited|locked) ;; # transient: no popup
+        *) notify_once "$name" "$state" "$urgency" "Drive sync failed: $name" "$msg" ;;
+    esac
+    log "✗ $name sync failed (exit $rc, $state): $msg"
+    case "$state" in
+        offline|rate-limited|locked) return 0 ;; # transient: retried next run
+    esac
+    return "$rc"
+}
+
+rotate_log
+
+# Prune old local backups.
+fd -t d --min-depth 2 --max-depth 2 --changed-before "${BACKUP_KEEP_DAYS}d" . "$BACKUP_ROOT" -x rm -rf -- {} 2>/dev/null
+
+if [ "$MODE" = normal ] && [ -n "${DRIVE_SYNC_TIMER:-}" ] && battery_too_low; then
+    log "Battery below ${MIN_BATTERY}% and discharging; skipping timer run"
+    exit 0
+fi
+
+if ! is_online; then
+    log "Offline (no route to Google APIs); skipping"
+    for entry in "${REMOTES[@]}"; do
+        IFS='|' read -r name _ _ <<<"$entry"
+        [ "$TARGET" = all ] || [ "$TARGET" = "$name" ] || continue
+        write_status "$name" offline "No network"
+    done
+    exit 0
+fi
+
+exit_code=0
+for entry in "${REMOTES[@]}"; do
+    IFS='|' read -r name remote local_dir <<<"$entry"
+    [ "$TARGET" = all ] || [ "$TARGET" = "$name" ] || continue
+    sync_remote "$name" "$remote" "$local_dir" || exit_code=1
+done
+
+exit "$exit_code"

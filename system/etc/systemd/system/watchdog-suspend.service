@@ -1,0 +1,14 @@
+[Unit]
+Description=Disarm the hardware watchdog while the system is suspended
+# sp5100_tco has no suspend handling; with s2idle the timer could fire during sleep.
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 0
+ExecStop=/usr/bin/busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 30000000
+
+[Install]
+WantedBy=sleep.target

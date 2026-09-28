@@ -1,0 +1,15 @@
+{{- range (includeTemplate "drive-remotes" . | splitList "\n") -}}
+{{- if ne . "" -}}
+{{- $f := splitList "|" . -}}
+{{- if stat (index $f 0) -}}
+file://{{ index $f 0 }} Drive - {{ index $f 2 }}
+{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- range list "programming/personal|Code - Personal" "programming/work|Code - Work" "Downloads|Downloads" "Documents|Documents" "Pictures|Pictures" -}}
+{{- $f := splitList "|" . -}}
+{{- $p := joinPath $.chezmoi.homeDir (index $f 0) -}}
+{{- if stat $p -}}
+file://{{ $p }} {{ index $f 1 }}
+{{ end -}}
+{{- end -}}

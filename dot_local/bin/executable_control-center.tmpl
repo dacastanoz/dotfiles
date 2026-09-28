@@ -1,0 +1,928 @@
+#!/usr/bin/env bash
+# Control center (rofi): Wi-Fi, Bluetooth, airplane mode, audio, displays, repair.
+#
+# Usage:
+#   control-center              open the main menu
+#   control-center wifi         Wi-Fi network picker
+#   control-center bluetooth    paired Bluetooth devices (connect/disconnect)
+#   control-center audio        choose audio output (sinks + card profiles)
+#   control-center mic          choose audio input (microphone)
+#   control-center displays     display layout / resolution / scaling menu
+#   control-center battery     battery: health, charge limit, power profile, calibration
+#   control-center details      active connection details (Wi-Fi password,
+#                               QR code to share Wi-Fi, copy, edit)
+#   control-center airplane     toggle airplane mode
+#   control-center radio-status notify current airplane state (used after the
+#                               Fn airplane key, which the kernel handles itself)
+#   control-center fix          repair connections (rfkill, radios, services)
+#   control-center status       print the status summary
+#
+# Everything here uses local tools only, so it works offline / in airplane mode.
+# Wi-Fi: saved profiles are only activated (never recreated or edited);
+# new networks are created with `nmcli device wifi connect` (autoconnect=yes).
+set -u
+
+APP="Control Center"
+POSTSWITCH="$HOME/.config/autorandr/postswitch"
+
+notify() { # notify <icon> <summary> [body]
+    notify-send -a "$APP" -i "$1" "$2" "${3:-}" 2>/dev/null || true
+}
+
+rofi_menu() { # rofi_menu <prompt> [message]
+    local args=(-dmenu -i -no-custom -show-icons -markup-rows -p "$1")
+    [ -n "${2:-}" ] && args+=(-mesg "$2")
+    rofi "${args[@]}"
+}
+
+# Print one rofi row with an icon: row <text> <icon>
+row() { printf '%s\0icon\x1f%s\n' "$1" "$2"; }
+
+# Pango markup escaping and its inverse.
+esc()   { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+unesc() { sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g' <<<"$1"; }
+
+# ============================================================ status
+wifi_enabled() { [ "$(nmcli -t radio wifi 2>/dev/null)" = "enabled" ]; }
+
+wifi_ssid() {
+    nmcli -t -e no -f ACTIVE,SSID dev wifi 2>/dev/null | awk -F: '$1=="yes"{sub(/^yes:/,""); print; exit}'
+}
+
+bt_powered() { bluetoothctl show 2>/dev/null | grep -q 'Powered: yes'; }
+
+# Airplane mode = every radio is soft-blocked.
+airplane_on() {
+    local states
+    states=$(rfkill -n -o SOFT 2>/dev/null) || return 1
+    [ -n "$states" ] && ! grep -q '^unblocked' <<<"$states"
+}
+
+# Friendly description of a sink/source (drops long "... Audio Controller" prefixes).
+dev_desc() { # dev_desc <sinks|sources> <name>
+    pactl -f json list "$1" 2>/dev/null |
+        jq -r --arg n "$2" '.[] | select(.name==$n) | .description | sub("^.*Audio Controller "; "")' 2>/dev/null
+}
+
+status_message() {
+    local wifi bt air out mic
+    if wifi_enabled; then
+        wifi=$(wifi_ssid); wifi=${wifi:-not connected}
+    else
+        wifi="off"
+    fi
+    if bt_powered; then bt="on"; else bt="off"; fi
+    if airplane_on; then air="ON"; else air="off"; fi
+    out=$(dev_desc sinks "$(pactl get-default-sink 2>/dev/null)"); out=${out:-none}
+    mic=$(dev_desc sources "$(pactl get-default-source 2>/dev/null)"); mic=${mic:-none}
+    printf 'Wi-Fi: <b>%s</b>   Bluetooth: <b>%s</b>   Airplane: <b>%s</b>\nOutput: <b>%s</b>\nInput: <b>%s</b>' \
+        "$(esc "$wifi")" "$bt" "$air" "$(esc "$out")" "$(esc "$mic")"
+}
+
+# ============================================================ radios
+toggle_wifi() {
+    if wifi_enabled; then
+        nmcli radio wifi off && notify network-wireless-offline "Wi-Fi turned off"
+    else
+        rfkill unblock wlan
+        nmcli radio wifi on && notify network-wireless "Wi-Fi turned on"
+    fi
+}
+
+toggle_bluetooth() {
+    if bt_powered; then
+        bluetoothctl power off >/dev/null && notify bluetooth-disabled "Bluetooth turned off"
+    else
+        rfkill unblock bluetooth
+        sleep 1
+        if bluetoothctl power on >/dev/null; then
+            notify bluetooth-active "Bluetooth turned on"
+        else
+            notify dialog-error "Bluetooth" "Could not power on the adapter. Try 'Fix connections'."
+        fi
+    fi
+}
+
+toggle_airplane() {
+    if airplane_on; then
+        rfkill unblock all
+        nmcli radio all on 2>/dev/null
+        sleep 1
+        bluetoothctl power on >/dev/null 2>&1
+        notify airplane-mode-disabled "Airplane mode OFF" "Wi-Fi and Bluetooth enabled"
+    else
+        nmcli radio all off 2>/dev/null
+        rfkill block all
+        notify airplane-mode "Airplane mode ON" "All radios disabled"
+    fi
+}
+
+fix_connections() {
+    notify view-refresh "Fixing connections..." "Unblocking radios and restarting services"
+    rfkill unblock all
+    nmcli radio all on 2>/dev/null
+    if pkexec systemctl restart NetworkManager.service bluetooth.service; then
+        sleep 3
+        bluetoothctl power on >/dev/null 2>&1
+        nmcli device wifi rescan >/dev/null 2>&1
+        notify emblem-ok "Connections repaired" "NetworkManager and Bluetooth restarted"
+    else
+        bluetoothctl power on >/dev/null 2>&1
+        notify dialog-warning "Services not restarted" "Authentication cancelled or failed; radios were unblocked"
+    fi
+}
+
+# ============================================================ Wi-Fi
+# Print "SSID<TAB>profile-name" for every saved Wi-Fi profile.
+saved_wifi_profiles() {
+    local name type ssid
+    while IFS=: read -r name type; do
+        [ "$type" = "802-11-wireless" ] || continue
+        ssid=$(nmcli -g 802-11-wireless.ssid connection show id "$name" 2>/dev/null)
+        [ -n "$ssid" ] && printf '%s\t%s\n' "$ssid" "$name"
+    done < <(nmcli -t -e no -f NAME,TYPE connection show 2>/dev/null)
+}
+
+wifi_menu() {
+    if ! wifi_enabled; then
+        rfkill unblock wlan
+        nmcli radio wifi on
+        sleep 2
+    fi
+    notify network-wireless "Scanning Wi-Fi networks..."
+    local list saved choice ssid security profile out rc pw
+    saved=$(saved_wifi_profiles)
+    # Fields: IN-USE:SIGNAL:SECURITY:SSID (SSID last, so it may contain ':').
+    # In-use first, then nmcli's signal order; one row per SSID.
+    list=$(nmcli -t -e no -f IN-USE,SIGNAL,SECURITY,SSID dev wifi list --rescan yes 2>/dev/null |
+        sort -s -t: -k1,1r |
+        awk -F: '{ssid=$0; sub(/^[^:]*:[^:]*:[^:]*:/,"",ssid); if (ssid=="" || seen[ssid]++) next;
+                   sec=($3=="" || $3=="--") ? "open" : $3;
+                   printf "%s\t%s\t%s\t%s\n", $1, ssid, $2, sec}')
+    if [ -z "$list" ]; then
+        notify network-wireless-offline "No Wi-Fi networks found"
+        return
+    fi
+    choice=$({
+        while IFS=$'\t' read -r inuse ssid signal security; do
+            local mark="" icon=network-wireless
+            [ "$inuse" = "*" ] && mark="* "
+            if awk -F'\t' -v s="$ssid" '$1==s{f=1} END{exit !f}' <<<"$saved"; then
+                security="$security, saved"; icon=network-wireless-connected
+            fi
+            row "$mark$(esc "$ssid")  ($signal%, $security)" "$icon"
+        done <<<"$list"
+        row "Disconnect Wi-Fi" network-wireless-disconnected
+        row "Edit connections..." preferences-system-network
+    } | rofi_menu "Wi-Fi") || return 0
+    case "$choice" in
+        "Disconnect Wi-Fi")
+            nmcli device disconnect "$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="wifi"{print $1; exit}')" && notify network-wireless-disconnected "Wi-Fi disconnected"
+            return ;;
+        "Edit connections...")
+            nm-connection-editor >/dev/null 2>&1 &
+            return ;;
+    esac
+    choice=$(unesc "$choice")
+    choice=${choice#"* "}
+    ssid=${choice%  (*}
+    security=${choice##*  (}; security=${security%)}; security=${security%, saved}
+    security=${security#*%, }
+
+    # Saved profile: only activate it (never recreate; enterprise profiles stay untouched).
+    profile=$(awk -F'\t' -v s="$ssid" '$1==s{print $2; exit}' <<<"$saved")
+    if [ -n "$profile" ]; then
+        notify network-wireless "Connecting..." "$ssid"
+        if out=$(nmcli connection up id "$profile" 2>&1); then
+            notify network-wireless "Connected" "$ssid"
+        else
+            notify dialog-error "Wi-Fi connection failed" "$out"
+        fi
+        return
+    fi
+    # Enterprise (802.1X) networks need more than a password: use the GUI editor.
+    if [[ "$security" == *802.1X* ]]; then
+        notify preferences-system-network "Enterprise network" "Set up '$ssid' in the connection editor (EAP method, identity, certificate)."
+        nm-connection-editor >/dev/null 2>&1 &
+        return
+    fi
+    if [ "$security" = "open" ]; then
+        out=$(nmcli device wifi connect "$ssid" 2>&1); rc=$?
+    else
+        pw=$(rofi -dmenu -password -p "Password for $ssid" -theme-str 'listview { lines: 0; }' </dev/null) || return 0
+        [ -z "$pw" ] && return 0
+        out=$(nmcli device wifi connect "$ssid" password "$pw" 2>&1); rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
+        notify network-wireless "Connected (saved)" "$ssid"
+    else
+        notify dialog-error "Wi-Fi connection failed" "$out"
+    fi
+}
+
+# ============================================================ Bluetooth
+bluetooth_menu() {
+    if ! bt_powered; then
+        rfkill unblock bluetooth; sleep 1
+        bluetoothctl power on >/dev/null 2>&1; sleep 1
+    fi
+    local devices choice mac name
+    devices=$(bluetoothctl devices Paired 2>/dev/null | awk '$1=="Device"')
+    choice=$({
+        while read -r _ mac name; do
+            [ -z "$mac" ] && continue
+            if bluetoothctl info "$mac" 2>/dev/null | grep -q 'Connected: yes'; then
+                row "Disconnect: $(esc "$name") [$mac]" bluetooth-active
+            else
+                row "Connect: $(esc "$name") [$mac]" bluetooth
+            fi
+        done <<<"$devices"
+        row "Headset mode (mic) / music mode..." audio-headset
+        row "Open Bluetooth manager..." blueman
+    } | rofi_menu "Bluetooth") || return 0
+    case "$choice" in
+        "Open Bluetooth manager...") blueman-manager >/dev/null 2>&1 & return ;;
+        "Headset mode (mic) / music mode...") audio_menu bluez; return ;;
+    esac
+    choice=$(unesc "$choice")
+    mac=${choice##*[}; mac=${mac%]}
+    name=${choice#*: }; name=${name% \[*}
+    if [[ "$choice" == Disconnect:* ]]; then
+        if bluetoothctl disconnect "$mac" >/dev/null 2>&1; then
+            notify bluetooth-disabled "Disconnected" "$name"
+        else
+            notify dialog-error "Could not disconnect" "$name"
+        fi
+    else
+        notify bluetooth "Connecting..." "$name"
+        if timeout 20 bluetoothctl connect "$mac" >/dev/null 2>&1; then
+            notify bluetooth-active "Connected" "$name"
+        else
+            notify dialog-error "Could not connect" "$name (is it on and in range?)"
+        fi
+    fi
+}
+
+# ============================================================ audio
+# Icon for a sink/source from its name and description.
+audio_icon() { # audio_icon <name> <description> <kind: sink|source>
+    case "$1 $2" in
+        *bluez*)                      echo audio-headset ;;
+        *HDMI*|*hdmi*|*DisplayPort*)  echo video-display ;;
+        *Headphone*|*headphone*|*Headset*|*headset*) echo audio-headphones ;;
+        *usb*|*USB*)                  echo audio-card ;;
+        *) [ "$3" = source ] && echo audio-input-microphone || echo audio-speakers ;;
+    esac
+}
+
+# Card profiles that could expose other outputs/inputs (e.g. HDMI, headset/HFP).
+# Prints "card<TAB>profile<TAB>label". Optional filter: card name substring.
+card_profiles() { # card_profiles <want: sinks|sources> [filter]
+    pactl -f json list cards 2>/dev/null | jq -r --arg want "$1" --arg f "${2:-}" '
+        .[] | select(.name | contains($f)) | . as $c
+        | ($c.properties["device.description"] // $c.name) as $cd
+        | $c.profiles | to_entries[]
+        | select(.key != "off" and .key != "pro-audio" and .key != $c.active_profile)
+        | select(.value.available and (.value[$want] > 0))
+        | "\($c.name)\t\(.key)\t\($cd): \(.value.description)"'
+}
+
+# Move every playing stream to the new default device.
+move_streams() { # move_streams <sink|source> <name>
+    local stream
+    if [ "$1" = sink ]; then
+        pactl list short sink-inputs 2>/dev/null | cut -f1 | while read -r stream; do
+            pactl move-sink-input "$stream" "$2" 2>/dev/null
+        done
+    else
+        pactl list short source-outputs 2>/dev/null | cut -f1 | while read -r stream; do
+            pactl move-source-output "$stream" "$2" 2>/dev/null
+        done
+    fi
+}
+
+# Switch a card profile, then make its first sink/source the default.
+apply_profile() { # apply_profile <sink|source> <card> <profile> <label>
+    local kind=$1 card=$2 profile=$3 label=$4 dev
+    if ! pactl set-card-profile "$card" "$profile" 2>/dev/null; then
+        notify dialog-error "Audio" "Could not switch to $label"
+        return
+    fi
+    for _ in 1 2 3 4 5 6; do
+        dev=$(pactl -f json list "${kind}s" 2>/dev/null | jq -r --arg c "$card" '
+            [.[] | select(.properties["device.name"]==$c)
+                 | select(.name | endswith(".monitor") | not)] | .[0].name // empty')
+        [ -n "$dev" ] && break
+        sleep 0.5
+    done
+    if [ -n "$dev" ]; then
+        pactl "set-default-$kind" "$dev"
+        move_streams "$kind" "$dev"
+    fi
+    notify audio-card "Audio profile" "$label"
+}
+
+# Generic device picker. kind=sink (outputs) or source (inputs).
+# Optional filter restricts card-profile rows (e.g. "bluez").
+device_menu() { # device_menu <sink|source> [filter]
+    local kind=$1 filter=${2:-} def devs profiles choice name prompt mixer_row
+    def=$(pactl "get-default-$kind" 2>/dev/null)
+    # name<TAB>friendly description<TAB>unplugged(true/false)
+    devs=$(pactl -f json list "${kind}s" 2>/dev/null | jq -r '
+        .[] | select(.name | endswith(".monitor") | not)
+        | (.active_port) as $ap
+        | ([.ports[]? | select(.name==$ap) | .availability] | .[0] // "unknown") as $av
+        | (.description | sub("^.*Audio Controller "; "")) as $d
+        | "\(.name)\t\($d)\t\($av == "not available")"')
+    profiles=$(card_profiles "${kind}s" "$filter")
+    if [ "$kind" = sink ]; then prompt="Audio output"; else prompt="Microphone"; fi
+    mixer_row="Volume mixer (pavucontrol)..."
+    choice=$({
+        if [ -z "$filter" ]; then
+            while IFS=$'\t' read -r name desc unplugged; do
+                [ -z "$name" ] && continue
+                local label
+                label=$(esc "$desc")
+                [ "$unplugged" = "true" ] && label="$label (unplugged)"
+                [ "$name" = "$def" ] && label="* $label"
+                row "$label" "$(audio_icon "$name" "$desc" "$kind")"
+            done <<<"$devs"
+        fi
+        while IFS=$'\t' read -r _ _ label; do
+            [ -z "$label" ] && continue
+            row "Switch profile: $(esc "$label")" audio-card
+        done <<<"$profiles"
+        row "$mixer_row" multimedia-volume-control
+    } | rofi_menu "$prompt") || return 0
+
+    if [ "$choice" = "$mixer_row" ]; then
+        pavucontrol >/dev/null 2>&1 & return
+    fi
+    choice=$(unesc "$choice")
+    if [[ "$choice" == "Switch profile: "* ]]; then
+        local label=${choice#Switch profile: } card profile
+        IFS=$'\t' read -r card profile _ < <(awk -F'\t' -v l="$label" '$3==l' <<<"$profiles")
+        [ -n "${card:-}" ] && apply_profile "$kind" "$card" "$profile" "$label"
+        return
+    fi
+    choice=${choice#"* "}; choice=${choice% (unplugged)}
+    name=$(awk -F'\t' -v d="$choice" '$2==d {print $1; exit}' <<<"$devs")
+    [ -z "$name" ] && return
+    pactl "set-default-$kind" "$name"
+    move_streams "$kind" "$name"
+    notify "$(audio_icon "$name" "$choice" "$kind")" "$prompt" "$choice"
+}
+
+audio_menu() { device_menu sink "${1:-}"; }
+mic_menu()   { device_menu source; }
+
+# ============================================================ displays
+internal_output() {
+    xrandr --query | awk '/ connected/ && $1 ~ /^(eDP|LVDS|DSI)/ {print $1; exit}'
+}
+
+external_output() {
+    xrandr --query | awk '/ connected/ && $1 !~ /^(eDP|LVDS|DSI)/ {print $1; exit}'
+}
+
+# Modes of an output as "WxH<TAB>rate<TAB>flags" (flags: * current, + preferred).
+output_modes() { # output_modes <output>
+    xrandr --query | awk -v o="$1" '
+        $1==o {inside=1; next}
+        inside && /^[^ \t]/ {inside=0}
+        inside && $1 ~ /^[0-9]+x[0-9]+/ {
+            res=$1
+            for (i=2; i<=NF; i++) {
+                r=$i; f=""
+                if (r ~ /\*/) f=f "*"
+                if (r ~ /\+/) f=f "+"
+                gsub(/[*+]/, "", r)
+                if (r != "" && !seen[res "@" r]++) printf "%s\t%s\t%s\n", res, r, f
+            }
+        }'
+}
+
+after_layout_change() {
+    [ -x "$POSTSWITCH" ] && AUTORANDR_CURRENT_PROFILE="$1" "$POSTSWITCH"
+}
+
+apply_layout() { # apply_layout <extend-right|extend-left|mirror|external|laptop>
+    local int ext rc
+    int=$(internal_output); ext=$(external_output)
+    if [ -z "$ext" ] && [ "$1" != laptop ]; then
+        notify video-display "Displays" "No external display detected"
+        return
+    fi
+    case "$1" in
+        extend-right) xrandr --output "$int" --auto --primary --output "$ext" --auto --right-of "$int" ;;
+        extend-left)  xrandr --output "$int" --auto --primary --output "$ext" --auto --left-of "$int" ;;
+        mirror)
+            # Mirror at the laptop resolution; scale the external if it lacks that mode.
+            local res
+            res=$(output_modes "$int" | awk -F'\t' '$3 ~ /\+/ {print $1; exit}')
+            res=${res:-1920x1080}
+            if output_modes "$ext" | awk -F'\t' -v r="$res" '$1==r{f=1} END{exit !f}'; then
+                xrandr --output "$int" --auto --primary --output "$ext" --mode "$res" --same-as "$int"
+            else
+                xrandr --output "$int" --auto --primary --output "$ext" --auto --scale-from "$res" --same-as "$int"
+            fi ;;
+        external)     xrandr --output "$ext" --auto --primary --output "$int" --off ;;
+        laptop)
+            if [ -n "$ext" ]; then
+                xrandr --output "$int" --auto --primary --output "$ext" --off
+            else
+                xrandr --output "$int" --auto --primary
+            fi ;;
+    esac
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        after_layout_change "$1"
+    else
+        notify dialog-error "Displays" "xrandr failed for layout '$1'"
+    fi
+}
+
+resolution_menu() {
+    local ext modes choice res rate
+    ext=$(external_output)
+    if [ -z "$ext" ]; then
+        notify video-display "Displays" "No external display detected"
+        return
+    fi
+    modes=$(output_modes "$ext")
+    choice=$(while IFS=$'\t' read -r res rate flags; do
+        local label="$res @ ${rate} Hz"
+        [[ "$flags" == *"+"* ]] && label="$label (preferred)"
+        [[ "$flags" == *"*"* ]] && label="* $label"
+        row "$label" video-display
+    done <<<"$modes" | rofi_menu "$ext resolution") || return 0
+    choice=${choice#"* "}
+    res=${choice%% @ *}
+    rate=${choice#* @ }; rate=${rate%% Hz*}
+    if xrandr --output "$ext" --mode "$res" --rate "$rate"; then
+        after_layout_change "$ext $res@$rate"
+    else
+        notify dialog-error "Displays" "Could not set $res @ $rate Hz on $ext"
+    fi
+}
+
+save_profile_menu() {
+    local name
+    name=$(rofi -dmenu -p "Profile name" -mesg "Saved layouts are re-applied automatically when the same monitors are connected" </dev/null) || return 0
+    name=$(tr -cd 'A-Za-z0-9._-' <<<"$name")
+    [ -z "$name" ] && return 0
+    if autorandr --save "$name" --force >/dev/null 2>&1; then
+        notify video-display "Display profile saved" "$name"
+    else
+        notify dialog-error "Displays" "Could not save profile $name"
+    fi
+}
+
+load_profile_menu() {
+    local choice
+    choice=$(autorandr --list 2>/dev/null | while read -r p; do row "$p" video-display; done |
+        rofi_menu "Load profile") || return 0
+    if autorandr --load "$choice" >/dev/null 2>&1; then
+        notify video-display "Display profile" "$choice"
+    else
+        notify dialog-error "Displays" "Could not load profile $choice"
+    fi
+}
+
+# Global UI scale for X11 (Xft.dpi): 96 = 100 %, 144 = 150 %.
+# Persisted in ~/.Xresources (loaded by the display manager at login).
+current_dpi() {
+    local d
+    d=$(xrdb -query 2>/dev/null | awk '/^Xft.dpi:/{print $2; exit}')
+    echo "${d:-96}"
+}
+
+set_scale() { # set_scale <dpi> <polybar-height>
+    local file="$HOME/.Xresources" tmp
+    tmp=$(mktemp)
+    [ -f "$file" ] && grep -v -e '^Xft.dpi:' -e '^polybar.height:' "$file" >"$tmp"
+    printf 'Xft.dpi: %s\npolybar.height: %s\n' "$1" "$2" >>"$tmp"
+    mv "$tmp" "$file"
+    xrdb -merge "$file"
+    "$HOME/.config/polybar/launch.sh" >/dev/null 2>&1 &
+    notify preferences-desktop-display "UI scale set to $(( $1 * 100 / 96 ))%" \
+        "Bar updated now. Restart apps (or log out) to rescale everything; \$mod+Shift+r restarts i3."
+}
+
+displays_menu() {
+    local ext int dpi scale_row choice
+    int=$(internal_output); ext=$(external_output)
+    dpi=$(current_dpi)
+    if [ "$dpi" -gt 100 ]; then scale_row="UI scale: 150% -> 100%"; else scale_row="UI scale: 100% -> 150% (HiDPI / 4K)"; fi
+    choice=$({
+        row "Extend right" video-display
+        row "Extend left" video-display
+        row "Mirror" video-display
+        row "External only" video-display
+        row "Laptop only" computer-laptop
+        row "External resolution / refresh..." preferences-desktop-display
+        row "$scale_row" zoom-in
+        row "Save layout as profile..." document-save
+        row "Load saved profile..." document-open
+        row "Open display settings (arandr)" preferences-desktop-display
+    } | rofi_menu "Displays" "Laptop: <b>${int:-none}</b>   External: <b>${ext:-not connected}</b>   Profile: <b>$(autorandr --current 2>/dev/null | head -1)</b>") || return 0
+    case "$choice" in
+        "Extend right")  apply_layout extend-right ;;
+        "Extend left")   apply_layout extend-left ;;
+        "Mirror")        apply_layout mirror ;;
+        "External only") apply_layout external ;;
+        "Laptop only")   apply_layout laptop ;;
+        "External resolution / refresh...") resolution_menu ;;
+        "UI scale: 150%"*) set_scale 96 24 ;;
+        "UI scale: 100%"*) set_scale 144 34 ;;
+        "Save layout as profile...") save_profile_menu ;;
+        "Load saved profile...") load_profile_menu ;;
+        "Open display settings (arandr)") arandr >/dev/null 2>&1 & ;;
+    esac
+}
+
+# ============================================================ connection details
+# Secrets (Wi-Fi password) are only read on an explicit action. They are passed
+# through stdin (rofi rows, qrencode, xclip), never as command-line arguments.
+declare -A CD=()
+CLIP_CLEAR_SECONDS=45
+
+# Primary active connection as "uuid<TAB>device<TAB>type" (Wi-Fi or Ethernet):
+# the one owning the default route, else the first active one. Empty if none.
+primary_connection() {
+    local dev
+    dev=$(ip route show default 2>/dev/null | awk '{for (i=1; i<NF; i++) if ($i=="dev") {print $(i+1); exit}}')
+    nmcli -t -e no -f UUID,DEVICE,TYPE connection show --active 2>/dev/null | awk -F: -v d="$dev" '
+        $3=="802-11-wireless" || $3=="802-3-ethernet" {
+            if ($2==d) {print $1 "\t" $2 "\t" $3; found=1; exit}
+            if (first=="") first=$1 "\t" $2 "\t" $3
+        }
+        END {if (!found && first!="") print first}'
+}
+
+wifi_band() { # wifi_band <"5500 MHz">
+    local f=${1%% *}
+    if ! [[ "$f" =~ ^[0-9]+$ ]]; then echo "?"
+    elif [ "$f" -lt 3000 ]; then echo "2.4 GHz"
+    elif [ "$f" -lt 5925 ]; then echo "5 GHz"
+    else echo "6 GHz"; fi
+}
+
+security_kind() { # security_kind <key-mgmt> -> psk|enterprise|open|wep|other
+    case "$1" in
+        wpa-psk|sae)                           echo psk ;;
+        wpa-eap|wpa-eap-suite-b-192|ieee8021x) echo enterprise ;;
+        none)                                  echo wep ;;
+        ""|owe)                                echo open ;;
+        *)                                     echo other ;;
+    esac
+}
+
+# Escape a value for the WIFI: QR format (\ ; , : " get a backslash).
+qr_escape() {
+    local s=$1
+    s=${s//\\/\\\\}; s=${s//;/\\;}; s=${s//,/\\,}; s=${s//:/\\:}; s=${s//\"/\\\"}
+    printf '%s' "$s"
+}
+
+wifi_qr_payload() { # wifi_qr_payload <ssid> <password or empty for open> <hidden yes|no>
+    if [ -n "$2" ]; then
+        printf 'WIFI:T:WPA;S:%s;P:%s;' "$(qr_escape "$1")" "$(qr_escape "$2")"
+    else
+        printf 'WIFI:T:nopass;S:%s;' "$(qr_escape "$1")"
+    fi
+    [ "${3:-no}" = yes ] && printf 'H:true;'
+    printf ';'
+}
+
+# Saved Wi-Fi password of a profile (polkit lets the desktop user read it).
+wifi_psk() { nmcli -s -e no -g 802-11-wireless-security.psk connection show uuid "$1" 2>/dev/null; }
+
+# Fill CD from a primary_connection line (empty line = not connected).
+load_details() { # load_details <"uuid<TAB>device<TAB>type">
+    CD=()
+    local uuid dev type line key val fields
+    IFS=$'\t' read -r uuid dev type <<<"$1"
+    [ -z "$uuid" ] && return 0
+    CD[uuid]=$uuid; CD[device]=$dev; CD[type]=$type
+    fields="connection.id,connection.autoconnect,connection.autoconnect-priority,connection.permissions"
+    [ "$type" = 802-11-wireless ] &&
+        fields+=",802-11-wireless.ssid,802-11-wireless.hidden,802-11-wireless-security.key-mgmt,802-1x.eap,802-1x.phase2-auth,802-1x.identity"
+    while IFS= read -r line; do
+        CD[${line%%:*}]=${line#*:}
+    done < <(nmcli -t -e no -f "$fields" connection show uuid "$uuid" 2>/dev/null)
+    # Device values; multi-value keys (IP4.ADDRESS[1], IP4.DNS[2]...) are joined.
+    while IFS= read -r line; do
+        key=${line%%:*}; key=${key%%\[*}; val=${line#*:}
+        [ -z "$val" ] && continue
+        if [ -n "${CD[$key]:-}" ]; then CD[$key]+=", $val"; else CD[$key]=$val; fi
+    done < <(nmcli -t -e no -f GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS,CAPABILITIES.SPEED device show "$dev" 2>/dev/null)
+    if [ "$type" = 802-11-wireless ]; then
+        local sig bars freq chan rate sec
+        IFS=: read -r _ sig bars freq chan rate sec < <(
+            nmcli -t -e no -f IN-USE,SIGNAL,BARS,FREQ,CHAN,RATE,SECURITY dev wifi list ifname "$dev" --rescan no 2>/dev/null |
+                awk -F: '$1=="*" {print; exit}')
+        CD[sigpct]=$sig; CD[bars]=$bars; CD[freq]=$freq; CD[chan]=$chan; CD[rate]=$rate; CD[security]=$sec
+    fi
+}
+
+# Plain "Label: value" lines for the loaded connection (never the password).
+details_text() {
+    if [ -z "${CD[uuid]:-}" ]; then
+        echo "Not connected (no active Wi-Fi or Ethernet connection)"
+        return
+    fi
+    local kind km perm
+    km=${CD[802-11-wireless-security.key-mgmt]:-}
+    kind=$(security_kind "$km")
+    printf 'Connection: %s\n' "${CD[connection.id]:-?}"
+    if [ "${CD[type]}" = 802-11-wireless ]; then
+        printf 'SSID: %s\n' "${CD[802-11-wireless.ssid]:-?}"
+        printf 'Signal: %s%% %s\n' "${CD[sigpct]:-?}" "${CD[bars]:-}"
+        printf 'Band: %s, channel %s\n' "$(wifi_band "${CD[freq]:-}")" "${CD[chan]:-?}"
+        printf 'Bitrate: %s\n' "${CD[rate]:-?}"
+        printf 'Security: %s (%s)\n' "${CD[security]:-none}" "${km:-open}"
+        case "$kind" in
+            enterprise)
+                printf 'EAP method: %s%s\n' "${CD[802-1x.eap]:-?}" "${CD[802-1x.phase2-auth]:+ / ${CD[802-1x.phase2-auth]}}"
+                printf 'Identity: %s\n' "${CD[802-1x.identity]:-?}" ;;
+            psk) echo "Password: hidden" ;;
+        esac
+    else
+        printf 'Type: Ethernet\nSpeed: %s\n' "${CD[CAPABILITIES.SPEED]:-?}"
+    fi
+    printf 'IPv4: %s\n' "${CD[IP4.ADDRESS]:-none}"
+    printf 'Gateway: %s\n' "${CD[IP4.GATEWAY]:-none}"
+    printf 'DNS: %s\n' "${CD[IP4.DNS]:-none}"
+    printf 'Device: %s\n' "${CD[device]}"
+    printf 'MAC: %s\n' "${CD[GENERAL.HWADDR]:-?}"
+    printf 'Autoconnect: %s (priority %s)\n' "${CD[connection.autoconnect]:-?}" "${CD[connection.autoconnect-priority]:-0}"
+    perm=${CD[connection.permissions]:-}
+    if [ -z "$perm" ]; then echo "Profile: system-wide (all users)"; else printf 'Profile: private (%s)\n' "$perm"; fi
+}
+
+# Text for "Copy all details": same as details_text, without the password line.
+details_plain() { details_text | grep -v '^Password:'; }
+
+clip_set() { xclip -selection clipboard -i >/dev/null 2>&1; } # reads stdin
+
+# Copy a secret from stdin; clear it after CLIP_CLEAR_SECONDS if still unchanged.
+copy_secret() {
+    local hash
+    hash=$(tee >(clip_set) | sha256sum | cut -d' ' -f1)
+    (
+        sleep "$CLIP_CLEAR_SECONDS"
+        [ "$(xclip -o -selection clipboard 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$hash" ] &&
+            clip_set </dev/null
+    ) >/dev/null 2>&1 &
+    disown
+}
+
+qr_viewer() {
+    local v
+    for v in imv feh eog; do command -v "$v" >/dev/null 2>&1 && { echo "$v"; return 0; }; done
+    return 1
+}
+
+show_wifi_qr() {
+    local viewer f psk=""
+    viewer=$(qr_viewer) || { notify dialog-error "Wi-Fi QR code" "No image viewer found (imv, feh or eog)"; return; }
+    [ "$(security_kind "${CD[802-11-wireless-security.key-mgmt]:-}")" = psk ] && psk=$(wifi_psk "${CD[uuid]}")
+    f=$(umask 077; mktemp --suffix=.png "${XDG_RUNTIME_DIR:-/tmp}/wifi-qr.XXXXXX") || return
+    chmod 600 "$f"
+    if ! wifi_qr_payload "${CD[802-11-wireless.ssid]}" "$psk" "${CD[802-11-wireless.hidden]:-no}" |
+        qrencode -s 10 -m 2 -o "$f"; then
+        rm -f "$f"
+        notify dialog-error "Wi-Fi QR code" "qrencode failed"
+        return
+    fi
+    psk=""
+    # The PNG is deleted as soon as the viewer window is closed.
+    (
+        case "$viewer" in
+            feh) feh --title "Wi-Fi QR code" --image-bg white "$f" ;;
+            eog) eog --new-instance "$f" ;;
+            *)   "$viewer" "$f" ;;
+        esac
+        rm -f "$f"
+    ) >/dev/null 2>&1 &
+    disown
+    notify network-wireless "Scan to join" "${CD[802-11-wireless.ssid]}"
+}
+
+password_menu() {
+    local psk choice ssid=${CD[802-11-wireless.ssid]}
+    psk=$(wifi_psk "${CD[uuid]}")
+    if [ -z "$psk" ]; then
+        notify dialog-warning "No saved password" "The password of '$ssid' is not stored in the profile (maybe in a keyring)."
+        return
+    fi
+    choice=$({
+        row "$(esc "$psk")" dialog-password
+        row "Copy password" edit-copy
+        row "Back" go-previous
+    } | rofi_menu "Password" "Password of <b>$(esc "$ssid")</b> (select it or 'Copy password' to copy)") || return 0
+    case "$choice" in
+        "Back") details_menu ;;
+        *) printf '%s' "$psk" | copy_secret
+           notify edit-copy "Password copied" "Clipboard is cleared in ${CLIP_CLEAR_SECONDS} s" ;;
+    esac
+}
+
+details_menu() {
+    local choice kind mesg
+    load_details "$(primary_connection)"
+    mesg=$(esc "$(details_text)" | sed -E 's|^([^:]+):|<b>\1:</b>|')
+    if [ -z "${CD[uuid]:-}" ]; then
+        choice=$({
+            row "Wi-Fi networks..." network-wireless
+            row "Network settings" preferences-system-network
+        } | rofi_menu "Connection" "$mesg") || return 0
+        case "$choice" in
+            "Wi-Fi networks...") wifi_menu ;;
+            "Network settings")  nm-connection-editor >/dev/null 2>&1 & ;;
+        esac
+        return
+    fi
+    kind=ethernet
+    [ "${CD[type]}" = 802-11-wireless ] && kind=$(security_kind "${CD[802-11-wireless-security.key-mgmt]:-}")
+    choice=$({
+        case "$kind" in
+            psk)
+                row "Show password" dialog-password
+                row "Copy password" edit-copy
+                row "Show QR code to share Wi-Fi" view-barcode-qr ;;
+            open) row "Show QR code to share Wi-Fi" view-barcode-qr ;;
+            enterprise) row "Password actions unavailable: 802.1X uses your personal login" dialog-information ;;
+        esac
+        row "Edit this connection..." preferences-system-network
+        row "Copy all details" edit-copy
+    } | rofi_menu "Connection" "$mesg") || return 0
+    case "$choice" in
+        "Show password") password_menu ;;
+        "Copy password")
+            if [ -n "$(wifi_psk "${CD[uuid]}")" ]; then
+                wifi_psk "${CD[uuid]}" | copy_secret
+                notify edit-copy "Password copied" "Clipboard is cleared in ${CLIP_CLEAR_SECONDS} s"
+            else
+                notify dialog-warning "No saved password" "The password is not stored in the profile (maybe in a keyring)."
+            fi ;;
+        "Show QR code to share Wi-Fi") show_wifi_qr ;;
+        "Password actions unavailable"*) details_menu ;;
+        "Edit this connection...") nm-connection-editor --edit "${CD[uuid]}" >/dev/null 2>&1 & ;;
+        "Copy all details")
+            details_plain | clip_set
+            notify edit-copy "Connection details copied" "${CD[connection.id]}" ;;
+    esac
+}
+
+# ============================================================ battery
+# Data and actions come from ~/.local/bin/battery-status (user side) and the root helper
+# /usr/local/bin/battery-care (health mode / calibration, via pkexec + polkit rule).
+BATTERY_STATUS="$HOME/.local/bin/battery-status"
+
+battery_menu() {
+    local info choice out icon status cap power tl tv limit calib profile tlevel mesg limit_label calib_label p mark
+    while :; do
+        info=$("$BATTERY_STATUS" info 2>/dev/null) || { notify battery-missing "Battery not found"; return 0; }
+        kv() { sed -n "s/^$1=//p" <<<"$info"; }
+        status=$(kv status); cap=$(kv capacity); power=$(kv power_w)
+        tl=$(kv time_label); tv=$(kv time); limit=$(kv limit); calib=$(kv calibration)
+        profile=$(kv profile); tlevel=$(kv thermal_level)
+        mesg="<b>${cap} %</b>  ·  $(esc "$status")  ·  $(esc "$tl"): <b>$(esc "$tv")</b>  ·  Draw <b>${power} W</b>"
+        case "$limit" in
+            1) mesg+=$'\n'"Charge limit: <b>80 % ON</b>" ;;
+            0) mesg+=$'\n'"Charge limit: <b>OFF</b> (charges to 100 %)" ;;
+            *) mesg+=$'\n'"Charge limit: <b>unavailable</b> (acer-wmi-battery not loaded)" ;;
+        esac
+        [ "$calib" = 1 ] && mesg+="  ·  <span foreground=\"#d08770\"><b>Calibration running</b></span>"
+        mesg+="  ·  Power profile: <b>$(esc "$profile")</b>"
+        [ "${tlevel:-0}" != 0 ] && mesg+="  ·  <span foreground=\"#bf616a\">thermal guard level $tlevel</span>"
+        mesg+=$'\n\n'"$("$BATTERY_STATUS" health-mesg 2>/dev/null)"
+        if [ "$limit" = 1 ]; then limit_label="Charge limit 80 %: turn OFF (charge to 100 %)"
+        else limit_label="Charge limit 80 %: turn ON (recommended)"; fi
+        if [ "$calib" = 1 ]; then calib_label="Calibration: stop"
+        else calib_label="Calibration: start (AC required, takes hours)"; fi
+        choice=$({
+            # Safe default first: Enter on the opened menu must not toggle anything.
+            row "Health history chart" office-chart-line
+            row "$limit_label" battery-good-charging
+            for p in power-saver balanced performance; do
+                mark=""; [ "$p" = "$profile" ] && mark="  (active)"
+                case "$p" in
+                    power-saver) icon=battery-good ;;
+                    balanced)    icon=preferences-system-power ;;
+                    *)           icon=speedometer ;;
+                esac
+                row "Profile: $p$mark" "$icon"
+            done
+            row "$calib_label" battery-caution
+            row "About calibration: plug AC; full discharge + recharge; stop it afterwards" dialog-information
+            row "Open btop (live power / CPU)" utilities-system-monitor
+        } | rofi_menu "Battery" "$mesg") || return 0
+        case "$choice" in
+            "Charge limit 80 %"*)  "$BATTERY_STATUS" toggle-limit ;;
+            "Profile: "*)
+                p=${choice#Profile: }; p=${p%%  (active)}
+                "$BATTERY_STATUS" set-profile "$p" ;;
+            "Health history chart") "$BATTERY_STATUS" history-popup; return 0 ;;
+            "Calibration: stop")
+                if out=$(SHELL=/bin/bash pkexec /usr/local/bin/battery-care calibration stop 2>&1); then
+                    notify battery "Calibration stopped" "Charge limit setting re-applied."
+                else notify dialog-error "Could not stop calibration" "$out"; fi ;;
+            "Calibration: start"*)
+                if [ "$(printf '%s\n' "No, cancel" "Yes, start calibration" | rofi_menu "Start calibration?" \
+                    "The firmware charges to 100 %, discharges fully and recharges once (several hours).
+Keep the charger plugged in and leave the laptop idle. Stop it from this menu when the battery is full again.")" = "Yes, start calibration" ]; then
+                    if out=$(SHELL=/bin/bash pkexec /usr/local/bin/battery-care calibration start 2>&1); then
+                        notify battery "Calibration started" "Keep AC plugged in. Stop it from the battery menu when finished."
+                    else notify dialog-error "Could not start calibration" "$out"; fi
+                fi ;;
+            "About calibration"*) ;;
+            "Open btop"*)
+                ghostty --class=dev.gentleman.popup --window-width=0 --window-height=0 --title=btop -e btop >/dev/null 2>&1 &
+                return 0 ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+# ============================================================ main
+main_menu() {
+    local choice{{ if .hasWifi }} wifi_label{{ end }}{{ if .hasBluetooth }} bt_label{{ end }} air_label
+{{- if .hasWifi }}
+    if wifi_enabled; then wifi_label="Wi-Fi: turn off"; else wifi_label="Wi-Fi: turn on"; fi
+{{- end }}
+{{- if .hasBluetooth }}
+    if bt_powered; then bt_label="Bluetooth: turn off"; else bt_label="Bluetooth: turn on"; fi
+{{- end }}
+    if airplane_on; then air_label="Airplane mode: turn off"; else air_label="Airplane mode: turn on"; fi
+    choice=$({
+{{- if .hasWifi }}
+        row "Wi-Fi networks..." network-wireless
+        row "$wifi_label" network-wireless-signal-excellent
+{{- end }}
+{{- if .hasBluetooth }}
+        row "Bluetooth devices..." bluetooth
+        row "$bt_label" bluetooth-active
+{{- end }}
+        row "$air_label" airplane-mode
+        row "Audio output..." audio-speakers
+        row "Microphone..." audio-input-microphone
+        row "Displays..." video-display
+{{- if .hasBattery }}
+        row "Battery..." battery
+{{- end }}
+        row "Connection details..." network-transmit-receive
+        row "Volume mixer" multimedia-volume-control
+        row "Network settings" preferences-system-network
+{{- if .hasBluetooth }}
+        row "Bluetooth manager" blueman
+{{- end }}
+        row "Fix connections" view-refresh
+    } | rofi_menu "Control" "$(status_message)") || exit 0
+    case "$choice" in
+        "Wi-Fi networks...")     wifi_menu ;;
+        "Wi-Fi: "*)              toggle_wifi ;;
+        "Bluetooth devices...")  bluetooth_menu ;;
+        "Bluetooth: "*)          toggle_bluetooth ;;
+        "Airplane mode: "*)      toggle_airplane ;;
+        "Audio output...")       audio_menu ;;
+        "Microphone...")         mic_menu ;;
+        "Displays...")           displays_menu ;;
+        "Battery...")            battery_menu ;;
+        "Connection details...") details_menu ;;
+        "Volume mixer")          pavucontrol >/dev/null 2>&1 & ;;
+        "Network settings")      nm-connection-editor >/dev/null 2>&1 & ;;
+        "Bluetooth manager")     blueman-manager >/dev/null 2>&1 & ;;
+        "Fix connections")       fix_connections ;;
+    esac
+}
+
+# Sourced (e.g. by tests): define functions only.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
+
+# Interactive entry points close an already open rofi instead of stacking menus.
+case "${1:-}" in
+    ""|wifi|bluetooth|audio|mic|displays|details|battery)
+        if pgrep -x rofi >/dev/null 2>&1; then pkill -x rofi; exit 0; fi ;;
+esac
+
+case "${1:-}" in
+    "")        main_menu ;;
+    wifi)      wifi_menu ;;
+    bluetooth) bluetooth_menu ;;
+    audio)     audio_menu ;;
+    mic)       mic_menu ;;
+    displays)  displays_menu ;;
+    battery)   battery_menu ;;
+    details)   details_menu ;;
+    airplane)  toggle_airplane ;;
+    radio-status)
+        sleep 1
+        if airplane_on; then notify airplane-mode "Airplane mode ON" "All radios disabled"
+        else notify airplane-mode-disabled "Airplane mode OFF" "Radios enabled"; fi ;;
+    fix)       fix_connections ;;
+    status)    status_message; echo ;;
+    *)         echo "usage: control-center [wifi|bluetooth|audio|mic|displays|battery|details|airplane|radio-status|fix|status]" >&2; exit 2 ;;
+esac

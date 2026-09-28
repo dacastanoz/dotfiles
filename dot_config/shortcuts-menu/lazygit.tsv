@@ -1,0 +1,23 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Help	?	Keybindings of the current panel
+Panels	1..5 / Tab	Status, files, branches, commits, stash
+Files	Space	Stage / unstage file
+Files	a	Stage / unstage all
+Files	Enter	Stage individual lines / hunks
+Files	d	Discard changes
+Files	e / o	Edit / open file
+Files	i	Add to .gitignore
+Commit	c	Commit
+Commit	C	Commit with the editor
+Commit	A	Amend last commit
+Remote	P / p	Push / pull
+Remote	f	Fetch (branches panel)
+Branches	n	New branch
+Branches	Space	Check out branch
+Branches	M / r	Merge / rebase onto the selected branch
+Stash	s / S	Stash all / stash options
+History	z / Z	Undo / redo
+Misc	/	Filter the current list
+Misc	q	Quit

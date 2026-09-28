@@ -1,0 +1,701 @@
+#!/usr/bin/env bash
+# shortcuts-menu: searchable rofi help for every shortcut and useful command.
+# Selecting a row runs it (or copies it when it is information only).
+#
+# Usage:
+#   shortcuts-menu              open the menu (categories first, Esc goes back)
+#   shortcuts-menu --category C open category C directly (all, i3-apps, nvim, tmux, ...)
+#   shortcuts-menu --list       print all rows as TSV: category, section, key, description, kind, action
+#   shortcuts-menu --counts     rows per category
+#   shortcuts-menu --rebuild    rebuild the cache and print the row count
+#   shortcuts-menu --run CAT N  run row N (0-based) of category CAT without rofi (testing)
+#
+# Everything is generated or data-driven, so the menu follows the configs:
+#   i3        ~/.config/i3/config: every bindsym. Label = "# desc: ..." comment right above
+#             the binding, else a built-in label. Resize-mode keys are listed separately.
+#   ghostty   `ghostty +list-keybinds` (defaults + user config, the effective set)
+#   tmux      ~/.tmux.conf bind lines + prefix; tmux defaults/plugins from tmux.tsv
+#   nvim      ~/.config/nvim/lua (vim.keymap.set and lazy `keys = {}` with desc, skipping
+#             plugins disabled in plugins/disabled.lua) + LazyVim essentials from nvim.tsv
+#   yazi      ~/.config/yazi/keymap.toml custom keys + defaults from yazi.tsv
+#   curated   ~/.config/shortcuts-menu/<category>.tsv (commands.tsv = Terminal commands)
+#             columns: section<TAB>key or command<TAB>description[<TAB>kind[<TAB>action]]
+# Results are cached in ~/.cache/shortcuts-menu and rebuilt when any source changes.
+#
+# Row kinds:
+#   i3      run the binding's exact i3 command with i3-msg (same behaviour as the key)
+#   term    run the command in a floating ghostty popup (class dev.gentleman.popup)
+#   launch  start a program (i3 exec, detached)
+#   copy    information only; Enter copies the key/command to the clipboard
+set -u
+
+DATA_DIR=${SHORTCUTS_DATA_DIR:-$HOME/.config/shortcuts-menu}
+I3_CONFIG=${SHORTCUTS_I3_CONFIG:-$HOME/.config/i3/config}
+TMUX_CONF=${SHORTCUTS_TMUX_CONF:-$HOME/.tmux.conf}
+GHOSTTY_CONFIG=$HOME/.config/ghostty/config
+NVIM_LUA=$HOME/.config/nvim/lua
+YAZI_KEYMAP=$HOME/.config/yazi/keymap.toml
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/shortcuts-menu
+CACHE=$CACHE_DIR/rows.tsv
+POPUP_CLASS=dev.gentleman.popup
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# Categories in display order: id|icon|color|title
+CATS=(
+    "i3-apps|"$'\U000F003B'"|#d08770|i3 · apps & launchers"
+    "i3-windows|"$'\U000F056E'"|#88c0d0|i3 · windows & workspaces"
+    "system|"$'\U000F0493'"|#81a1c1|System & connections"
+    "media|"$'\U000F075A'"|#b48ead|Media & screenshots"
+    "monitoring|"$'\U000F050F'"|#bf616a|Monitoring"
+    "files|"$'\U000F024B'"|#ebcb8b|Files & apps"
+    "dev|"$'\U000F0169'"|#a3be8c|Dev toolkit"
+    "terminal|"$'\U000F018D'"|#88c0d0|Terminal commands"
+    "ghostty|"$'\U000F02A0'"|#5e81ac|Ghostty terminal"
+    "tmux|"$''"|#a3be8c|tmux"
+    "nvim|"$''"|#8fbcbb|Neovim / LazyVim"
+    "yazi|"$'\U000F01E5'"|#ebcb8b|yazi file manager"
+    "lazygit|"$'\U000F02A2'"|#d08770|lazygit"
+    "shell|"$'\U000F023A'"|#81a1c1|Shell: fish, zoxide, atuin, fzf"
+)
+ALL_ICON=$'\U000F0349'
+# Row kind glyphs: run (i3), term, launch, copy
+KIND_ICONS=$'\U000F040A'"|"$'\U000F018D'"|"$'\U000F03CC'"|"$'\U000F018F'
+
+cat_ids() { local c; for c in "${CATS[@]}"; do printf '%s\n' "${c%%|*}"; done; }
+
+# ============================================================ i3
+i3_rows() {
+    [ -r "$I3_CONFIG" ] || return 0
+    awk '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+
+    function pretty_part(p,   n) {
+        if (p == "$mod" || p == "Mod4") return "Super"
+        if (p == "Mod1") return "Alt"
+        if (tolower(p) == "shift") return "Shift"
+        if (tolower(p) == "ctrl" || tolower(p) == "control") return "Ctrl"
+        if (p == "Return") return "Enter"
+        if (p == "grave") return "`"
+        if (p == "space") return "Space"
+        if (p == "slash") return "/"
+        if (p == "Print") return "PrtSc"
+        if (p == "Escape") return "Esc"
+        if (p ~ /^XF86/) {
+            n = substr(p, 5)
+            if (n == "AudioRaiseVolume") return "Volume Up key"
+            if (n == "AudioLowerVolume") return "Volume Down key"
+            if (n == "AudioMute") return "Mute key"
+            if (n == "AudioPlay") return "Play key"
+            if (n == "AudioPause") return "Pause key"
+            if (n == "AudioNext") return "Next key"
+            if (n == "AudioPrev") return "Previous key"
+            if (n == "MonBrightnessUp") return "Brightness Up key"
+            if (n == "MonBrightnessDown") return "Brightness Down key"
+            if (n == "Display") return "Fn Display key"
+            if (n == "RFKill") return "Fn Airplane key"
+            if (n == "WLAN") return "Fn Wi-Fi key"
+            return n " key"
+        }
+        if (length(p) == 1) return toupper(p)
+        return p
+    }
+
+    function pretty_key(k,   parts, n, i, out) {
+        n = split(k, parts, "+")
+        out = ""
+        for (i = 1; i <= n; i++) out = out (i > 1 ? "+" : "") pretty_part(parts[i])
+        return out
+    }
+
+    # Built-in labels for bindings without a "# desc:" comment.
+    function label(c) {
+        if (c ~ /shortcuts-menu/) return "Shortcuts / help menu (this list)"
+        if (c ~ /rofi-launcher/) return "App launcher"
+        if (c ~ /rofi -show combi/) return "Rofi: windows + commands"
+        if (c ~ /rofi-powermenu/) return "Power menu"
+        if (c ~ /control-center details/) return "Connection details"
+        if (c ~ /control-center audio/) return "Audio output picker"
+        if (c ~ /control-center mic/) return "Microphone picker"
+        if (c ~ /control-center displays/) return "Displays menu"
+        if (c ~ /control-center radio-status/) return "Show airplane / radio status"
+        if (c ~ /control-center/) return "Control center"
+        if (c ~ /display-toggle/) return "Quick display cycle"
+        if (c ~ /i3lock/) return "Lock screen"
+        if (c ~ /thunar/) return "File manager (Thunar)"
+        if (c ~ /blueman-manager/) return "Bluetooth manager"
+        if (c ~ /gnome-calculator/) return "Calculator"
+        if (c ~ /playerctl play-pause/) return "Media play / pause"
+        if (c ~ /playerctl next/) return "Media next track"
+        if (c ~ /playerctl previous/) return "Media previous track"
+        if (c ~ /pamixer.* -ui/) return "Volume up (up to 250%)"
+        if (c ~ /pamixer.* -ud/) return "Volume down"
+        if (c ~ /amixer .*toggle/) return "Mute / unmute"
+        if (c ~ /brightnessctl set \+/) return "Brightness up"
+        if (c ~ /brightnessctl set [0-9]+%-/) return "Brightness down"
+        if (c ~ /maim -s/) return "Screenshot area to clipboard"
+        if (c ~ /maim /) return "Screenshot full screen to file"
+        if (c ~ /dunstctl close-all/) return "Close all notifications"
+        if (c ~ /dunstctl history-pop/) return "Show last notification again"
+        if (c ~ /setxkbmap/) return "Switch keyboard layout"
+        if (c ~ /tmux new-session -A -s main/) return "Terminal attached to tmux session main"
+        if (c ~ /lazygit/) return "lazygit popup"
+        if (c ~ /yazi/) return "yazi popup"
+        if (c ~ /nvim-project/) return "Neovim project quick-open"
+        if (c ~ /temperature\.sh/) return "Temperature / system monitor"
+        if (c ~ /^exec (--no-startup-id )?ghostty$/) return "Terminal"
+        if (c == "kill") return "Close window"
+        if (c == "split h") return "Split horizontally (next window to the right)"
+        if (c == "split v") return "Split vertically (next window below)"
+        if (c == "split toggle") return "Toggle split direction"
+        if (c == "fullscreen toggle") return "Fullscreen (toggle)"
+        if (c == "layout stacking") return "Stacked layout"
+        if (c == "layout tabbed") return "Tabbed layout"
+        if (c == "layout toggle split") return "Split layout (toggle horizontal / vertical)"
+        if (c == "sticky toggle") return "Sticky floating window (visible on every workspace)"
+        if (c == "floating toggle") return "Floating / tiling (toggle)"
+        if (c == "focus mode_toggle") return "Switch focus between tiling and floating windows"
+        if (c == "focus parent") return "Focus parent container"
+        if (c == "reload") return "Reload i3 config"
+        if (c == "restart") return "Restart i3 in place (keeps windows)"
+        if (c == "exit") return "Exit i3 (log out)"
+        if (c ~ /^mode "?resize"?$/) return "Resize mode (see the resize mode rows)"
+        if (c ~ /^resize shrink width/) return "Shrink width"
+        if (c ~ /^resize grow width/) return "Grow width"
+        if (c ~ /^resize shrink height/) return "Shrink height"
+        if (c ~ /^resize grow height/) return "Grow height"
+        if (c ~ /^mode "?default"?$/) return "Leave resize mode"
+        return c
+    }
+
+    function category(c, k) {
+        if (k ~ /XF86Audio|XF86MonBrightness|Print/ || c ~ /playerctl|pamixer|amixer|brightnessctl|maim/)
+            return "media"
+        if (c ~ /lazygit|yazi|nvim-project|tmux/) return "dev"
+        if (c ~ /temperature\.sh|btop/) return "monitoring"
+        if (c ~ /control-center|display-toggle|blueman|rofi-powermenu|i3lock|dunstctl|setxkbmap/)
+            return "system"
+        if (c ~ /^exec /) return "i3-apps"
+        return "i3-windows"
+    }
+
+    function emit(cat, section, key, desc, kind, action) {
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", cat, section, key, desc, kind, action
+    }
+
+    {
+        line = trim($0)
+
+        if (line ~ /^set \$[A-Za-z0-9_]+[ \t]/) {
+            name = line; sub(/^set /, "", name); sub(/[ \t].*$/, "", name)
+            value = line; sub(/^set \$[A-Za-z0-9_]+[ \t]+/, "", value)
+            vars[name] = value
+            nvars++; order[nvars] = name
+        }
+
+        if (line ~ /^mode[ \t].*\{$/) {
+            mode = line; sub(/^mode[ \t]+/, "", mode); sub(/[ \t]*\{$/, "", mode); gsub(/"/, "", mode)
+        } else if (mode != "" && line == "}") {
+            mode = ""
+        } else if (line ~ /^bindsym[ \t]/) {
+            rest = line; sub(/^bindsym[ \t]+/, "", rest)
+            while (rest ~ /^--/) sub(/^--[^ \t]+[ \t]+/, "", rest)
+            key = rest; sub(/[ \t].*$/, "", key)
+            cmd = rest; sub(/^[^ \t]+[ \t]+/, "", cmd)
+            # Expand config variables ($term, ...); i3-msg does not know them.
+            for (i = nvars; i >= 1; i--) {
+                v = order[i]
+                if (v == "$mod") continue
+                while ((p = index(cmd, v)) > 0 && substr(cmd, p + length(v), 1) !~ /[A-Za-z0-9_]/)
+                    cmd = substr(cmd, 1, p - 1) vars[v] substr(cmd, p + length(v))
+            }
+            desc = (prev ~ /^#[ \t]*desc:/) ? prev : ""
+            sub(/^#[ \t]*desc:[ \t]*/, "", desc)
+            if (desc == "") desc = label(cmd)
+
+            if (mode != "") {
+                emit("i3-windows", mode " mode", pretty_key(key), desc, "copy", pretty_key(key))
+            }
+            # Repetitive bindings collapse into one summary row each.
+            else if (cmd ~ /^workspace number /) { if (!seen["ws"]++) emit("i3-windows", "i3", "Super+1..0", "Switch to workspace 1-10", "copy", "Super+1..0") }
+            else if (cmd ~ /^move container to workspace /) { if (!seen["mv"]++) emit("i3-windows", "i3", "Super+Shift+1..0", "Move window to workspace 1-10", "copy", "Super+Shift+1..0") }
+            else if (cmd ~ /^focus (left|right|up|down)$/) { if (!seen["fo"]++) emit("i3-windows", "i3", "Super+Arrows", "Focus window left / down / up / right", "copy", "Super+Arrows") }
+            else if (cmd ~ /^move (left|right|up|down)$/) { if (!seen["mw"]++) emit("i3-windows", "i3", "Super+Shift+Arrows", "Move window left / down / up / right", "copy", "Super+Shift+Arrows") }
+            else emit(category(cmd, key), "i3", pretty_key(key), desc, "i3", cmd)
+        }
+        if (line != "") prev = line
+    }
+    END {
+        emit("i3-windows", "i3", "Super+drag", "Move a floating window with the mouse (right button resizes)", "copy", "Super+drag")
+    }' "$I3_CONFIG"
+}
+
+# ============================================================ ghostty
+ghostty_rows() {
+    command -v ghostty >/dev/null || return 0
+    ghostty +list-keybinds 2>/dev/null | awk '
+    function pk(p) {
+        if (p == "ctrl") return "Ctrl"
+        if (p == "shift") return "Shift"
+        if (p == "alt") return "Alt"
+        if (p == "super") return "Super"
+        if (p ~ /^arrow_/) { p = substr(p, 7); return toupper(substr(p, 1, 1)) substr(p, 2) }
+        if (p == "page_up") return "PgUp"
+        if (p == "page_down") return "PgDn"
+        if (p == "escape") return "Esc"
+        if (p == "enter") return "Enter"
+        if (p == "insert") return "Insert"
+        if (p == "home") return "Home"
+        if (p == "end") return "End"
+        if (p == "tab") return "Tab"
+        if (length(p) == 1 || p ~ /^f[0-9]+$/) return toupper(p)
+        return p
+    }
+    function pretty(k,   base, last, n, parts, i, out) {
+        if (k ~ /\+\+$/) { base = substr(k, 1, length(k) - 2); last = "+" }
+        else { n = split(k, parts, "+"); last = parts[n]; base = (n > 1) ? substr(k, 1, length(k) - length(last) - 1) : "" }
+        out = ""
+        if (base != "") { n = split(base, parts, "+"); for (i = 1; i <= n; i++) out = out pk(parts[i]) "+" }
+        return out pk(last)
+    }
+    function describe(a,   arg) {
+        arg = a; sub(/^[^:]*:?/, "", arg)
+        if (a ~ /^reload_config/) return "Misc|Reload config"
+        if (a ~ /^open_config/) return "Misc|Open config file"
+        if (a ~ /^copy_to_clipboard/) return "Clipboard|Copy"
+        if (a ~ /^paste_from_clipboard/) return "Clipboard|Paste"
+        if (a ~ /^paste_from_selection/) return "Clipboard|Paste primary selection"
+        if (a ~ /^select_all/) return "Clipboard|Select all"
+        if (a ~ /^increase_font_size/) return "Font|Bigger font"
+        if (a ~ /^decrease_font_size/) return "Font|Smaller font"
+        if (a ~ /^reset_font_size/) return "Font|Reset font size"
+        if (a == "new_window") return "Windows|New window"
+        if (a ~ /^close_window/) return "Windows|Close window"
+        if (a == "quit") return "Windows|Quit ghostty"
+        if (a == "toggle_fullscreen") return "Windows|Fullscreen (toggle)"
+        if (a == "toggle_quick_terminal") return "Windows|Quick terminal (drop-down)"
+        if (a == "new_tab") return "Tabs|New tab"
+        if (a ~ /^close_tab/) return "Tabs|Close tab"
+        if (a == "previous_tab") return "Tabs|Previous tab"
+        if (a == "next_tab") return "Tabs|Next tab"
+        if (a == "last_tab") return "Tabs|Last tab"
+        if (a ~ /^goto_tab:/) return "Tabs|Go to tab N"
+        if (a ~ /^new_split:/) return "Splits|New split " (arg == "down" ? "below" : arg == "up" ? "above" : "to the " arg)
+        if (a ~ /^goto_split:/) return "Splits|Focus split " arg
+        if (a ~ /^resize_split:/) { sub(/,.*/, "", arg); return "Splits|Resize split " arg }
+        if (a == "toggle_split_zoom") return "Splits|Zoom split (toggle)"
+        if (a == "equalize_splits") return "Splits|Equalize splits"
+        if (a ~ /^close_surface/) return "Splits|Close split / tab"
+        if (a == "start_search") return "Search|Search the scrollback"
+        if (a == "end_search") return "Search|End search"
+        if (a ~ /^jump_to_prompt:-/) return "Scroll|Jump to previous prompt"
+        if (a ~ /^jump_to_prompt:/) return "Scroll|Jump to next prompt"
+        if (a == "scroll_page_up") return "Scroll|Scroll page up"
+        if (a == "scroll_page_down") return "Scroll|Scroll page down"
+        if (a == "scroll_to_top") return "Scroll|Scroll to top"
+        if (a == "scroll_to_bottom") return "Scroll|Scroll to bottom"
+        if (a == "clear_screen") return "Misc|Clear screen and scrollback"
+        if (a == "toggle_command_palette") return "Misc|Command palette"
+        if (a ~ /^inspector/) return "Misc|Terminal inspector (debug)"
+        if (a ~ /^write_screen_file:paste/) return "Misc|Paste the scrollback as a file path (type nvim first)"
+        if (a ~ /^write_screen_file:copy/) return "Misc|Copy the scrollback file path"
+        if (a ~ /^write_screen_file:open/) return "Misc|Open the scrollback in the editor"
+        if (a ~ /^text:.*x1b.*r$/) return "Misc|New line without sending (Claude Code, CLIs)"
+        if (a ~ /^adjust_selection/ || a == "unbind") return ""
+        gsub(/_/, " ", a)
+        return "Misc|" a
+    }
+    /^keybind = / {
+        s = substr($0, 11)
+        # key=action; the key itself may contain "=" (ctrl+==...), so split at the last "=" before the action name.
+        if (!match(s, /=[a-z_]+(:.*)?$/)) next
+        k = substr(s, 1, RSTART - 1); a = substr(s, RSTART + 1)
+        if (k ~ /digit_/ || k == "copy" || k == "paste") next
+        d = describe(a)
+        if (d == "") next
+        id = (a ~ /^goto_tab:/) ? "goto_tab" : a
+        pk_ = (id == "goto_tab") ? "Alt+1..8" : pretty(k)
+        if (!(id in keys)) { keys[id] = pk_; descs[id] = d; n++; ord[n] = id }
+        else if (index(" / " keys[id] " / ", " / " pk_ " / ") == 0) keys[id] = keys[id] " / " pk_
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            id = ord[i]; split(descs[id], p, "|")
+            printf "ghostty\t%s\t%s\t%s\tcopy\t%s\n", p[1], keys[id], p[2], keys[id]
+        }
+    }'
+}
+
+# `ghostty +list-keybinds` takes ~0.4 s, so its rows get their own cache that only
+# changes with the ghostty config or binary.
+ghostty_rows_cached() {
+    local gc=$CACHE_DIR/ghostty.tsv bin
+    bin=$(command -v ghostty 2>/dev/null) || return 0
+    if [ ! -s "$gc" ] || [ -n "$(find "$GHOSTTY_CONFIG" "$bin" -newer "$gc" -print -quit 2>/dev/null)" ]; then
+        ghostty_rows >"$gc.tmp" && mv -f "$gc.tmp" "$gc"
+    fi
+    cat "$gc" 2>/dev/null
+}
+
+# ============================================================ tmux
+tmux_prefix() {
+    local p
+    p=$(awk '/^[ \t]*set(-option)?[ \t]+(-[gs]+[ \t]+)?prefix[ \t]/ { v = $NF } END { print v }' "$TMUX_CONF" 2>/dev/null)
+    tmux_pretty "${p:-C-b}"
+}
+
+tmux_pretty() { # C-a -> Ctrl+a, M-g -> Alt+g
+    sed -e 's/C-/Ctrl+/g' -e 's/M-/Alt+/g' -e 's/S-/Shift+/g' <<<"$1"
+}
+
+tmux_rows() {
+    [ -r "$TMUX_CONF" ] || return 0
+    local prefix
+    prefix=$(tmux_prefix)
+    awk -v P="$prefix" '
+    function pretty(k) { gsub(/C-/, "Ctrl+", k); gsub(/M-/, "Alt+", k); gsub(/S-/, "Shift+", k); gsub(/"/, "", k); return k }
+    function label(c) {
+        if (c ~ /^split-window -h/) return "Split pane left | right (same folder)"
+        if (c ~ /^split-window -v/) return "Split pane top / bottom (same folder)"
+        if (c ~ /^send-prefix/) return "Send " P " to the program inside tmux"
+        if (c ~ /kill-session -a/) return "Kill every other session (asks first)"
+        if (c ~ /copy-pipe-and-cancel/) return "Copy the selection to the clipboard (copy mode)"
+        if (c ~ /scratch/) return "Floating scratch session (toggle, same folder)"
+        return c
+    }
+    BEGIN { printf "tmux\tPrefix\t%s\tPrefix: press it, release, then the key\tcopy\t%s\n", P, P }
+    {
+        line = $0; sub(/^[ \t]+/, "", line)
+        if (skip > 0) { t = line; o = gsub(/\{/, "", t); c = gsub(/\}/, "", t); skip += o - c; if (skip <= 0) skip = 0; prev = line; next }
+        if (line ~ /^bind(-key)?[ \t]/) {
+            n = split(line, w, /[ \t]+/)
+            tbl = "prefix"; note = ""; i = 2
+            while (i <= n && w[i] ~ /^-/) {
+                if (w[i] == "-n") tbl = "root"
+                else if (w[i] == "-T") { i++; tbl = w[i] }
+                else if (w[i] ~ /^-T./) tbl = substr(w[i], 3)
+                i++
+            }
+            key = w[i]; cmd = ""
+            for (j = i + 1; j <= n; j++) cmd = cmd (cmd == "" ? "" : " ") w[j]
+            if (line ~ /\{[ \t]*$/) { skip = 1; if (index($0, "scratch") == 0) { getline nxt; cmd = cmd " " nxt; t = nxt; skip += gsub(/\{/, "", t) - gsub(/\}/, "", t) } }
+            desc = (prev ~ /^#[ \t]*desc:/) ? prev : ""
+            sub(/^#[ \t]*desc:[ \t]*/, "", desc)
+            if (desc == "") desc = label(cmd)
+            if (desc == cmd && cmd ~ /if-shell/ && line ~ /\{/) desc = "Custom binding (see ~/.tmux.conf)"
+            if (tbl == "root") k = pretty(key)
+            else if (tbl == "prefix") k = P ", " pretty(key)
+            else if (tbl ~ /copy-mode/) k = "copy mode: " pretty(key)
+            else k = tbl ": " pretty(key)
+            sec = (tbl == "root") ? "No prefix" : (tbl ~ /copy-mode/) ? "Copy mode" : "Config"
+            printf "tmux\t%s\t%s\t%s\tcopy\t%s\n", sec, k, desc, k
+        }
+        if (line != "") prev = line
+    }' "$TMUX_CONF"
+}
+
+# ============================================================ neovim
+nvim_rows() {
+    [ -d "$NVIM_LUA" ] || return 0
+    local disabled leader files
+    disabled=$(awk '
+        /^[ \t]*"[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+",?[ \t]*(--.*)?$/ { r = $0; gsub(/^[ \t]*"|",?[ \t]*(--.*)?$/, "", r) }
+        /^[ \t]*enabled[ \t]*=[ \t]*false/ && r != "" { print r; r = "" }' "$NVIM_LUA/plugins/disabled.lua" 2>/dev/null)
+    leader=$(awk -F'"' '/vim\.g\.mapleader[ \t]*=/ { print $2; exit }' "$NVIM_LUA"/config/*.lua 2>/dev/null)
+    files=("$NVIM_LUA"/config/keymaps.lua "$NVIM_LUA"/plugins/*.lua)
+    awk -v disabled="$disabled" -v leader="${leader:- }" '
+    BEGIN { n = split(disabled, d, "\n"); for (i = 1; i <= n; i++) dis[d[i]] = 1 }
+
+    function strip_strings(s) { gsub(/"[^"]*"/, "", s); gsub(/\047[^\047]*\047/, "", s); sub(/--.*$/, "", s); return s }
+    function count(s, ch,   t) { t = s; return gsub(ch, "", t) }
+
+    # <leader>ac -> "Space a c", <C-h> -> "Ctrl+h", gpd -> "gpd"
+    function pretty(k,   out, t, rest, lead, tok, m, last) {
+        out = ""; lead = 0; rest = k; last = ""
+        while (rest != "") {
+            if (match(rest, /^<[^>]+>/)) {
+                tok = substr(rest, 2, RLENGTH - 2); rest = substr(rest, RLENGTH + 1)
+                m = tolower(tok)
+                if (m == "leader") { t = (leader == " ") ? "Space" : leader; lead = 1 }
+                else if (m == "cr" || m == "return" || m == "enter") t = "Enter"
+                else if (m == "esc") t = "Esc"
+                else if (m == "space") t = "Space"
+                else if (m == "tab") t = "Tab"
+                else if (m == "bs") t = "Backspace"
+                else if (m ~ /^c-/) t = "Ctrl+" substr(tok, 3)
+                else if (m ~ /^[ma]-/) t = "Alt+" substr(tok, 3)
+                else if (m ~ /^s-/) t = "Shift+" substr(tok, 3)
+                else t = tok
+                out = out (out == "" ? "" : " ") t; last = "b"
+            } else {
+                t = substr(rest, 1, 1); rest = substr(rest, 2)
+                out = out ((out != "" && (lead || last == "b")) ? " " : "") t; last = "c"
+            }
+        }
+        return out
+    }
+
+    function emit(key, desc) {
+        if (key == "" || desc == "" || desc ~ /^\+/ || (cur_repo in dis)) return
+        gsub(/^[ \t]+|[ \t]+$/, "", desc)
+        printf "nvim\t%s\t%s\t%s\tcopy\t%s\n", section(), pretty(key), desc, pretty(key)
+    }
+    function section(   s) {
+        if (FILENAME ~ /config\/keymaps\.lua$/) return "config"
+        s = cur_repo; sub(/^.*\//, "", s); sub(/\.nvim$/, "", s); sub(/^nvim-/, "", s)
+        return (s == "") ? "plugin" : s
+    }
+    function flush_entry() {
+        if (in_entry) { if (!e_group) emit(e_key, (e_desc != "") ? e_desc : e_comment) }
+        in_entry = 0; e_key = ""; e_desc = ""; e_comment = ""; e_group = 0
+    }
+    function process_stmt(s,   rest, key, rhs, desc) {
+        rest = s; sub(/.*vim\.keymap\.set\([ \t]*/, "", rest)
+        if (rest ~ /^\{/) sub(/^\{[^}]*\}[ \t]*,[ \t]*/, "", rest)
+        else sub(/^"[^"]*"[ \t]*,[ \t]*/, "", rest)
+        if (!match(rest, /^"[^"]*"/)) return
+        key = substr(rest, 2, RLENGTH - 2); rest = substr(rest, RLENGTH + 1)
+        gsub(/\\\\/, "\\", key)
+        rhs = ""
+        if (match(rest, /^[ \t]*,[ \t]*"[^"]*"/)) { rhs = substr(rest, RSTART, RLENGTH); sub(/^[ \t]*,[ \t]*"/, "", rhs); sub(/"$/, "", rhs) }
+        desc = ""
+        if (match(s, /desc[ \t]*=[ \t]*"[^"]*"/)) { desc = substr(s, RSTART, RLENGTH); sub(/^desc[ \t]*=[ \t]*"/, "", desc); sub(/"$/, "", desc) }
+        if (desc == "") desc = stmt_comment
+        if (desc == "" && match(rhs, /^<[cC][mM][dD]>.*<[cC][rR]>$/)) desc = ":" substr(rhs, 6, length(rhs) - 9)
+        emit(key, desc)
+    }
+
+    FNR == 1 { flush_entry(); cur_repo = ""; depth = 0; in_keys = 0; in_deps = 0; stmt = ""; pdepth = 0 }
+
+    {
+        line = $0
+        bare = strip_strings(line)
+
+        # Current plugin spec: a line that is only "owner/repo" (or { "owner/repo").
+        if (in_deps && depth <= deps_depth) in_deps = 0
+        if (!in_deps && bare ~ /dependencies[ \t]*=[ \t]*\{/ && count(bare, "\\{") > count(bare, "\\}")) { in_deps = 1; deps_depth = depth }
+        if (line ~ /^[ \t]*\{?[ \t]*"[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+",?[ \t]*(--.*)?$/ && !in_keys && !in_deps) {
+            r = line; gsub(/^[ \t]*\{?[ \t]*"|",?[ \t]*(--.*)?$/, "", r); cur_repo = r
+        }
+
+        # vim.keymap.set(...) statements, possibly spanning several lines.
+        if (stmt == "" && line ~ /vim\.keymap\.set\(/) {
+            stmt = line; stmt_comment = ""
+            if (match(line, /\)[ \t]*--[ \t].*$/)) { stmt_comment = substr(line, RSTART); sub(/^\)[ \t]*--[ \t]*/, "", stmt_comment) }
+            pdepth = count(bare, "\\(") - count(bare, "\\)")
+            if (pdepth <= 0) { process_stmt(stmt); stmt = "" }
+        } else if (stmt != "") {
+            stmt = stmt " " line
+            pdepth += count(bare, "\\(") - count(bare, "\\)")
+            if (pdepth <= 0) { process_stmt(stmt); stmt = "" }
+        }
+
+        # Oil buffer keymaps: ["<C-s>"] = { ..., desc = "..." }
+        if (line ~ /^[ \t]*\["[^"]+"\][ \t]*=.*desc[ \t]*=[ \t]*"/) {
+            k = line; sub(/^[ \t]*\["/, "", k); sub(/"\].*$/, "", k)
+            ds = line; sub(/.*desc[ \t]*=[ \t]*"/, "", ds); sub(/".*$/, "", ds)
+            emit(k, "In Oil: " ds)
+        }
+
+        # lazy.nvim keys = { { "key", ..., desc = "..." }, ... }
+        before = depth
+        opens = count(bare, "\\{"); closes = count(bare, "\\}")
+        if (!in_keys && bare ~ /keys[ \t]*=[ \t]*\{/) { in_keys = 1; keys_depth = before }
+        else if (in_keys) {
+            if (before == keys_depth + 1 && line ~ /^[ \t]*\{/) {
+                flush_entry(); in_entry = 1
+                if (match(line, /^[ \t]*\{[ \t]*"[^"]*"/)) { e_key = substr(line, RSTART, RLENGTH); sub(/^[ \t]*\{[ \t]*"/, "", e_key); sub(/"$/, "", e_key) }
+                if (line ~ /^[ \t]*\{[ \t]*"[^"]*"[ \t]*,[ \t]*nil/) e_group = 1
+            } else if (in_entry && e_key == "" && before == keys_depth + 2 && match(line, /^[ \t]*"[^"]*"/)) {
+                e_key = substr(line, RSTART, RLENGTH); sub(/^[ \t]*"/, "", e_key); sub(/"$/, "", e_key)
+            } else if (in_entry && e_key == "" && line ~ /^[ \t]*--/) {
+                e_comment = line; sub(/^[ \t]*--+[ \t]*/, "", e_comment)
+            }
+            if (in_entry) {
+                if (e_desc == "" && match(line, /desc[ \t]*=[ \t]*"[^"]*"/)) { e_desc = substr(line, RSTART, RLENGTH); sub(/^desc[ \t]*=[ \t]*"/, "", e_desc); sub(/"$/, "", e_desc) }
+                if (bare ~ /(^|[ \t,{])group[ \t]*=/) e_group = 1
+            }
+        }
+        depth = before + opens - closes
+        if (in_keys && in_entry && depth <= keys_depth + 1) flush_entry()
+        if (in_keys && depth <= keys_depth) { flush_entry(); in_keys = 0 }
+    }
+    END { flush_entry() }' "${files[@]}" 2>/dev/null
+}
+
+# ============================================================ yazi custom keys
+yazi_rows() {
+    [ -r "$YAZI_KEYMAP" ] || return 0
+    awk '
+    function flush() { if (on != "" && desc != "") printf "yazi\tCustom\t%s\t%s\tcopy\t%s\n", on, desc, on; on = ""; desc = "" }
+    /^\[\[/ { flush() }
+    /^on[ \t]*=/ { on = $0; sub(/^on[ \t]*=[ \t]*/, "", on); gsub(/[\[\]"]/, "", on); gsub(/,[ \t]*/, " ", on)
+                   gsub(/<C-/, "Ctrl+", on); gsub(/<A-/, "Alt+", on); gsub(/<S-/, "Shift+", on); gsub(/>/, "", on)
+                   if (on ~ /Ctrl\+[a-z]$/) on = substr(on, 1, length(on) - 1) toupper(substr(on, length(on))) }
+    /^desc[ \t]*=/ { desc = $0; sub(/^desc[ \t]*=[ \t]*"/, "", desc); sub(/"[ \t]*$/, "", desc) }
+    END { flush() }' "$YAZI_KEYMAP"
+}
+
+# ============================================================ curated TSV files
+tsv_rows() {
+    [ -d "$DATA_DIR" ] || return 0
+    local f cat kind prefix
+    prefix=$(tmux_prefix)
+    for f in "$DATA_DIR"/*.tsv; do
+        [ -r "$f" ] || continue
+        cat=$(basename "$f" .tsv)
+        [ "$cat" = "commands" ] && cat=terminal
+        case "$cat" in terminal|monitoring|dev) kind=term ;; *) kind=copy ;; esac
+        awk -F'\t' -v cat="$cat" -v dkind="$kind" -v P="$prefix" '
+        /^[ \t]*(#|$)/ { next }
+        NF >= 3 {
+            key = $2; desc = $3
+            if (cat == "tmux") { gsub(/<prefix> /, P ", ", key); gsub(/<prefix>/, P, key); gsub(/<prefix>/, P, desc) }
+            kind = ($4 != "") ? $4 : dkind
+            if (kind == "info") kind = "copy"
+            action = ($5 != "") ? $5 : key
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", cat, $1, key, desc, kind, action
+        }' "$f"
+    done
+}
+
+# ============================================================ cache
+cache_fresh() {
+    [ -s "$CACHE" ] || return 1
+    local newer
+    newer=$(find "$SELF" "$I3_CONFIG" "$TMUX_CONF" "$GHOSTTY_CONFIG" "$YAZI_KEYMAP" "$DATA_DIR" \
+        "$NVIM_LUA" "$(command -v ghostty 2>/dev/null || echo /nonexistent)" \
+        -newer "$CACHE" -print -quit 2>/dev/null)
+    [ -z "$newer" ]
+}
+
+build_cache() {
+    mkdir -p "$CACHE_DIR"
+    local tmp
+    tmp=$(mktemp "$CACHE_DIR/rows.XXXXXX") || return 1
+    {
+        i3_rows; tsv_rows; ghostty_rows_cached; tmux_rows; nvim_rows; yazi_rows
+    } | awk -F'\t' -v order="$(cat_ids)" '
+        BEGIN { n = split(order, o, "\n"); for (i = 1; i <= n; i++) idx[o[i]] = i }
+        NF >= 5 && $3 != "" { c = ($1 in idx) ? idx[$1] : n + 1; rows[c] = rows[c] $0 "\n" }
+        END { for (i = 1; i <= n + 1; i++) printf "%s", rows[i] }' >"$tmp"
+    mv -f "$tmp" "$CACHE"
+}
+
+ensure_cache() { cache_fresh || build_cache; }
+
+# ============================================================ rendering
+cat_field() { # cat_field <id> <n>: 2=icon 3=color 4=title
+    local c
+    for c in "${CATS[@]}"; do
+        [ "${c%%|*}" = "$1" ] && { cut -d'|' -f"$2" <<<"$c"; return; }
+    done
+}
+
+render_categories() {
+    awk -F'\t' -v cats="$(printf '%s\n' "${CATS[@]}")" -v all_icon="$ALL_ICON" '
+    function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+    { cnt[$1]++; total++ }
+    END {
+        printf "<span foreground=\"#eceff4\">%s</span>   <b>%-34s</b> <span foreground=\"#4c566a\">%4d</span>\n", all_icon, "All (search everything)", total
+        n = split(cats, c, "\n")
+        for (i = 1; i <= n; i++) {
+            if (c[i] == "") continue
+            split(c[i], f, "|")
+            printf "<span foreground=\"%s\">%s</span>   <span foreground=\"%s\"><b>%s</b></span>%s <span foreground=\"#4c566a\">%4d</span>\n", f[3], f[2], f[3], esc(f[4]), sprintf("%*s", 34 - length(f[4]), ""), cnt[f[1]] + 0
+        }
+    }' "$CACHE"
+}
+
+# Rows of one category ("all" = every row) in rofi markup.
+render_rows() { # render_rows <cat>
+    awk -F'\t' -v want="$1" -v cats="$(printf '%s\n' "${CATS[@]}")" -v kinds="$KIND_ICONS" '
+    function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+    function fit(s, w) { if (length(s) > w) s = substr(s, 1, w - 1) "…"; return sprintf("%-" w "s", s) }
+    BEGIN {
+        n = split(cats, c, "\n")
+        for (i = 1; i <= n; i++) { split(c[i], f, "|"); icon[f[1]] = f[2]; color[f[1]] = f[3] }
+        split(kinds, k, "|")
+        kicon["i3"] = k[1]; kcol["i3"] = "#a3be8c"
+        kicon["term"] = k[2]; kcol["term"] = "#88c0d0"
+        kicon["launch"] = k[3]; kcol["launch"] = "#a3be8c"
+        kicon["copy"] = k[4]; kcol["copy"] = "#4c566a"
+    }
+    want == "all" || $1 == want {
+        col = ($1 in color) ? color[$1] : "#d8dee9"
+        printf "<span foreground=\"%s\">%s  %s</span> <span foreground=\"%s\">%s</span>  <b>%s</b>  %s\n",
+            col, icon[$1], esc(fit($2, 14)), kcol[$5], kicon[$5], esc(fit($3, 30)), esc($4)
+    }' "$CACHE"
+}
+
+row_at() { # row_at <cat> <index>: print the TSV row
+    awk -F'\t' -v want="$1" -v n="$2" 'want == "all" || $1 == want { if (i++ == n) { print; exit } }' "$CACHE"
+}
+
+# ============================================================ actions
+run_row() { # run_row <kind> <action>
+    local kind=$1 action=$2
+    case "$kind" in
+        i3)
+            i3-msg -q -- "$action" ;;
+        launch)
+            i3-msg -q -- "exec --no-startup-id $action" ;;
+        term)
+            setsid -f ghostty --class="$POPUP_CLASS" --window-width=0 --window-height=0 \
+                --title="$action" \
+                -e fish -c "$action; echo; read -P 'Press Enter to close ' -l _answer" \
+                >/dev/null 2>&1 ;;
+        copy)
+            printf '%s' "$action" | xclip -selection clipboard
+            notify-send -a "Shortcuts" -i edit-copy -t 3000 "Copied to clipboard" "$action" 2>/dev/null || true ;;
+    esac
+}
+
+rofi_theme_cats='window { width: 62ch; } listview { lines: 15; } element-icon { enabled: false; }'
+rofi_theme_rows='window { width: 132ch; } listview { lines: 20; } element-icon { enabled: false; }'
+
+menu() { # menu [category]: optional category to open first
+    ensure_cache
+    local ids choice cat title sel=0 idx row kind action start=${1:-} i
+    mapfile -t ids < <(echo all; cat_ids)
+    while :; do
+        if [ -n "$start" ]; then
+            cat=$start; start=""
+            for i in "${!ids[@]}"; do [ "${ids[$i]}" = "$cat" ] && sel=$i; done
+        else
+            choice=$(render_categories | rofi -dmenu -i -no-custom -markup-rows -format i \
+                -selected-row "$sel" -p "Shortcuts" \
+                -mesg "Pick a category (or All). Inside a list: type to search, Enter runs or copies, Esc comes back here." \
+                -theme-str "$rofi_theme_cats") || return 0
+            [ -n "$choice" ] || return 0
+            sel=$choice
+            cat=${ids[$choice]}
+        fi
+        if [ "$cat" = all ]; then title="All shortcuts"; else title=$(cat_field "$cat" 4); fi
+        idx=$(render_rows "$cat" | rofi -dmenu -i -no-custom -markup-rows -matching fuzzy \
+            -sort -sorting-method fzf -format i -p "$title" \
+            -mesg "<span foreground=\"#a3be8c\">$(cut -d'|' -f1 <<<"$KIND_ICONS")</span> runs   <span foreground=\"#88c0d0\">$(cut -d'|' -f2 <<<"$KIND_ICONS")</span> terminal   <span foreground=\"#a3be8c\">$(cut -d'|' -f3 <<<"$KIND_ICONS")</span> opens   <span foreground=\"#4c566a\">$(cut -d'|' -f4 <<<"$KIND_ICONS")</span> info (Enter copies)      Esc: back" \
+            -theme-str "$rofi_theme_rows") || continue
+        [ -n "$idx" ] || continue
+        row=$(row_at "$cat" "$idx")
+        kind=$(cut -f5 <<<"$row"); action=$(cut -f6- <<<"$row")
+        run_row "$kind" "$action"
+        return 0
+    done
+}
+
+case "${1:-}" in
+    --list) ensure_cache; cat "$CACHE" ;;
+    --counts)
+        ensure_cache
+        awk -F'\t' '{ c[$1]++; t++ } END { for (k in c) printf "%-12s %d\n", k, c[k]; printf "%-12s %d\n", "TOTAL", t }' "$CACHE" | sort ;;
+    --rebuild) rm -f "$CACHE_DIR/ghostty.tsv"; build_cache; wc -l <"$CACHE" ;;
+    --render) ensure_cache; if [ "${2:-}" = cats ]; then render_categories; else render_rows "${2:-all}"; fi ;;
+    --run)
+        ensure_cache
+        row=$(row_at "${2:?category}" "${3:?index}")
+        [ -n "$row" ] || { echo "no such row" >&2; exit 1; }
+        run_row "$(cut -f5 <<<"$row")" "$(cut -f6- <<<"$row")" ;;
+    --category) menu "${2:?category id (all, i3-apps, nvim, tmux, ...)}" ;;
+    "") menu ;;
+    *) echo "usage: shortcuts-menu [--category CAT|--list|--counts|--rebuild|--render [cats|CAT]|--run CAT N]" >&2; exit 2 ;;
+esac

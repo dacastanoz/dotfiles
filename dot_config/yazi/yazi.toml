@@ -1,0 +1,20 @@
+[mgr]
+show_hidden    = false
+sort_by        = "natural"
+sort_dir_first = true
+linemode       = "size"
+
+[preview]
+max_width  = 1200
+max_height = 1600
+
+# Openers: text/code in Neovim (inside the current terminal), everything else via xdg-open (defaults).
+[opener]
+nvim = [{ run = "nvim %s", block = true, desc = "Neovim", for = "unix" }]
+
+[open]
+prepend_rules = [
+	{ mime = "text/*", use = ["nvim", "reveal"] },
+	{ mime = "application/{json,ndjson,x-ndjson,javascript,toml,yaml,x-yaml,xml,x-sh,x-shellscript,sql}", use = ["nvim", "reveal"] },
+	{ mime = "inode/empty", use = ["nvim", "reveal"] },
+]

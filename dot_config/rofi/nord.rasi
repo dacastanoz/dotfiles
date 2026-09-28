@@ -1,0 +1,107 @@
+/* Nord theme for rofi - compact, rounded, with icons */
+* {
+    nord0:  #2e3440;
+    nord1:  #3b4252;
+    nord2:  #434c5e;
+    nord3:  #4c566a;
+    nord4:  #d8dee9;
+    nord6:  #eceff4;
+    nord8:  #88c0d0;
+    nord9:  #81a1c1;
+    nord11: #bf616a;
+
+    background-color: transparent;
+    text-color:       @nord4;
+    font:             "JetBrainsMono Nerd Font 10";
+}
+
+window {
+    width:            560px;
+    background-color: @nord0;
+    border:           2px;
+    border-color:     @nord8;
+    border-radius:    10px;
+    padding:          12px;
+}
+
+mainbox {
+    spacing:  10px;
+    children: [ inputbar, message, listview ];
+}
+
+inputbar {
+    background-color: @nord1;
+    border-radius:    8px;
+    padding:          8px 12px;
+    spacing:          8px;
+    children:         [ prompt, entry ];
+}
+
+prompt {
+    text-color: @nord8;
+}
+
+entry {
+    placeholder:       "Search...";
+    placeholder-color: @nord3;
+    text-color:        @nord6;
+}
+
+message {
+    background-color: @nord1;
+    border-radius:    8px;
+    padding:          8px 12px;
+}
+
+textbox {
+    text-color: @nord4;
+}
+
+listview {
+    lines:        10;
+    columns:      1;
+    spacing:      4px;
+    fixed-height: false;
+    scrollbar:    false;
+    cycle:        true;
+}
+
+element {
+    padding:       6px 10px;
+    spacing:       10px;
+    border-radius: 6px;
+}
+
+element normal.normal, element alternate.normal {
+    background-color: transparent;
+    text-color:       @nord4;
+}
+
+element normal.urgent, element alternate.urgent {
+    text-color: @nord11;
+}
+
+element normal.active, element alternate.active {
+    text-color: @nord8;
+}
+
+element selected.normal, element selected.active {
+    background-color: @nord2;
+    text-color:       @nord6;
+}
+
+element selected.urgent {
+    background-color: @nord11;
+    text-color:       @nord6;
+}
+
+element-icon {
+    size:             22px;
+    background-color: transparent;
+}
+
+element-text {
+    background-color: transparent;
+    text-color:       inherit;
+    vertical-align:   0.5;
+}

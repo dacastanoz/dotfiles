@@ -1,0 +1,24 @@
+
+[Default Applications]
+x-scheme-handler/antigravity=antigravity.desktop
+x-scheme-handler/claude-cli=claude-code-url-handler.desktop
+text/html=google-chrome.desktop
+x-scheme-handler/http=google-chrome.desktop
+x-scheme-handler/https=google-chrome.desktop
+x-scheme-handler/about=google-chrome.desktop
+x-scheme-handler/unknown=google-chrome.desktop
+text/plain=com.microsoft.VSCode.desktop
+text/markdown=com.microsoft.VSCode.desktop
+text/x-markdown=com.microsoft.VSCode.desktop
+application/json=com.microsoft.VSCode.desktop
+application/x-shellscript=com.microsoft.VSCode.desktop
+text/x-python=com.microsoft.VSCode.desktop
+text/x-csrc=com.microsoft.VSCode.desktop
+text/x-c++src=com.microsoft.VSCode.desktop
+text/x-log=com.microsoft.VSCode.desktop
+application/xml=com.microsoft.VSCode.desktop
+text/css=com.microsoft.VSCode.desktop
+text/javascript=com.microsoft.VSCode.desktop
+application/x-yaml=com.microsoft.VSCode.desktop
+application/toml=com.microsoft.VSCode.desktop
+inode/directory=thunar.desktop

@@ -1,0 +1,28 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Open	Thunar	File manager	launch	thunar
+{{- range (includeTemplate "drive-remotes" . | splitList "\n") }}{{ if ne . "" }}{{ $f := splitList "|" . }}
+Open	Thunar: Drive - {{ index $f 2 }}	Google Drive folder	launch	thunar {{ index $f 1 }}
+{{- end }}{{ end }}
+Open	Thunar: Code - Personal	Programming folder	launch	thunar ~/programming/personal
+Open	Thunar: Code - Work	Programming folder	launch	thunar ~/programming/work
+Open	Thunar: Downloads	Downloads folder	launch	thunar ~/Downloads
+Apps	Notion	Notion (Chrome app window)	launch	gtk-launch notion
+Apps	WhatsApp	WhatsApp Web (Chrome app)	launch	gtk-launch chrome-hnpfjngllnobngcgfapefoaidbinmjnm-Default
+Apps	VS Code	Visual Studio Code	launch	code
+Apps	Obsidian	Obsidian notes	launch	obsidian
+Apps	Chrome	Google Chrome	launch	google-chrome-stable
+Apps	Calculator	GNOME Calculator	launch	gnome-calculator
+Thunar keys	Ctrl+H	Show / hide hidden files
+Thunar keys	Ctrl+L	Type a path
+Thunar keys	F2	Rename
+Thunar keys	Ctrl+T	New tab
+Thunar keys	F3	Split view (two panes)
+Thunar keys	Ctrl+Shift+N	New folder
+Thunar keys	Alt+Up / Backspace	Parent folder
+Thunar keys	Ctrl+1 / Ctrl+2 / Ctrl+3	Icon / list / compact view
+Thunar keys	Right-click	Open Terminal Here, Open in VS Code, Open in Neovim, Copy Path, Drag and Drop
+Drag and drop	dragon-drop <files>	Small window to drag files into a browser or chat app
+Drag and drop	yazi: Ctrl+N	Drag the selected files out with dragon-drop
+Drives	udiskie	USB drives mount automatically; tray icon while one is plugged in

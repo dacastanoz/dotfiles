@@ -1,0 +1,38 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Sessions	<prefix> s	Pick a session
+Sessions	<prefix> $	Rename session
+Sessions	<prefix> ( / )	Previous / next session
+Sessions	<prefix> D	Choose a client to detach (prefix d splits in this config)
+Sessions	tmux detach	Detach from the terminal (or <prefix> : detach)
+Windows	<prefix> c	New window
+Windows	<prefix> ,	Rename window
+Windows	<prefix> n / p	Next / previous window
+Windows	<prefix> Ctrl+N / Ctrl+P	Next / previous window (tmux-sensible)
+Windows	<prefix> 1..9	Go to window N (numbering starts at 1)
+Windows	<prefix> a	Last window (tmux-sensible)
+Windows	<prefix> w	Tree of sessions and windows
+Windows	<prefix> &	Kill window
+Panes	Ctrl+H / J / K / L	Move between panes and Neovim splits (vim-tmux-navigator)
+Panes	<prefix> Arrows	Move to the pane in that direction
+Panes	<prefix> Ctrl+Arrows	Resize pane (repeatable)
+Panes	<prefix> z	Zoom pane (toggle)
+Panes	<prefix> x	Kill pane
+Panes	<prefix> q	Show pane numbers
+Panes	<prefix> { / }	Swap pane with previous / next
+Panes	<prefix> !	Move pane to its own window
+Copy mode	<prefix> [	Enter copy mode (vi keys, mouse also works)
+Copy mode	Space / v	Start selection (copy mode)
+Copy mode	/ and ?	Search down / up (copy mode)
+Copy mode	q	Leave copy mode
+Plugins	<prefix> Space	Which-key menu of tmux commands (tmux-which-key)
+Plugins	<prefix> Ctrl+S	Save sessions (tmux-resurrect)
+Plugins	<prefix> Ctrl+R	Restore sessions (tmux-resurrect)
+Plugins	<prefix> y	Copy the command line to the clipboard (tmux-yank)
+Plugins	<prefix> I	Install plugins (tpm)
+Plugins	<prefix> U	Update plugins (tpm)
+Misc	<prefix> R	Reload ~/.tmux.conf (tmux-sensible)
+Misc	<prefix> :	Command prompt
+Misc	<prefix> ?	List every key binding
+Misc	<prefix> t	Big clock

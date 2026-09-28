@@ -1,0 +1,15 @@
+# Extra yazi keys (defaults stay active).
+[[mgr.prepend_keymap]]
+on   = "<C-n>"
+run  = 'shell -- dragon-drop -x -a -T "$@"'
+desc = "Drag selected files out (dragon-drop)"
+
+[[mgr.prepend_keymap]]
+on   = "<C-t>"
+run  = 'shell --orphan -- ghostty --working-directory="$PWD"'
+desc = "Open a terminal in the current folder"
+
+[[mgr.prepend_keymap]]
+on   = "<C-e>"
+run  = 'shell --orphan -- thunar "$PWD"'
+desc = "Open current folder in Thunar"

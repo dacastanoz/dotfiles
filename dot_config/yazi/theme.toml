@@ -1,0 +1,12 @@
+# Accent colors from the Gentleman terminal palette (ghostty), so yazi matches the terminal.
+[mgr]
+cwd = { fg = "#7fb4ca", bold = true }
+border_style = { fg = "#8a8fa3" }
+
+[mode]
+normal_main = { fg = "#06080f", bg = "#7fb4ca", bold = true }
+normal_alt  = { fg = "#7fb4ca", bg = "#263356" }
+select_main = { fg = "#06080f", bg = "#b7cc85", bold = true }
+select_alt  = { fg = "#b7cc85", bg = "#263356" }
+unset_main  = { fg = "#06080f", bg = "#cb7c94", bold = true }
+unset_alt   = { fg = "#cb7c94", bg = "#263356" }

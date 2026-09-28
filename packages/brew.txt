@@ -1,0 +1,6 @@
+# Homebrew formulae (only installed when brew is present, e.g. after Gentleman.Dots).
+# Used by nvim-project, the lazygit popup and the shortcuts menu.
+lazygit
+zoxide
+neovim
+tmux

@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+# Runs after autorandr applies a display profile (hotplug, login, resume,
+# or the control-center Displays menu): redraw bars and wallpaper.
+# When triggered by the system autorandr.service (hotplug/resume) this runs with
+# the environment of a random user process and inside that system unit's cgroup,
+# so ask i3 to start polybar (i3's session environment/PATH, i3's scope);
+# fall back to a direct launch when i3 is not reachable.
+export DISPLAY="${DISPLAY:-:0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+if ! i3-msg -q "exec --no-startup-id $HOME/.config/polybar/launch.sh" >/dev/null 2>&1; then
+  "$HOME/.config/polybar/launch.sh" >/dev/null 2>&1 &
+fi
+[ -f "$HOME/.config/i3/wallpaper.png" ] && feh --no-fehbg --bg-fill "$HOME/.config/i3/wallpaper.png"
+notify-send -a Displays -i video-display "Display profile" "${AUTORANDR_CURRENT_PROFILE:-applied}" 2>/dev/null || true

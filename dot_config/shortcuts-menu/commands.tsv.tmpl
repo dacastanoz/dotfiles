@@ -1,0 +1,42 @@
+# Terminal commands. Columns (TAB separated): section, command, description[, kind[, action]].
+# kind: term (default here: runs in a floating ghostty popup), launch (starts a GUI program), copy (info only, Enter copies).
+Drive	drive-sync	Sync all Google Drive folders now (rclone bisync)
+Drive	drive-sync --dry-run	Show what a sync would change, touch nothing
+Drive	drive-sync-status --long	Per-folder sync status and last result
+Drive	drive-sync --resync <target>	Rebuild the sync baseline of one folder (after checking!)	copy
+Control center	control-center status	Print Wi-Fi, Bluetooth, airplane and audio status
+Control center	control-center wifi	Wi-Fi network picker	launch	~/.local/bin/control-center wifi
+{{- if .hasBluetooth }}
+Control center	control-center bluetooth	Paired Bluetooth devices (connect / disconnect)	launch	~/.local/bin/control-center bluetooth
+{{- end }}
+Control center	control-center airplane	Toggle airplane mode	launch	~/.local/bin/control-center airplane
+Control center	control-center fix	Repair connections (radios, NetworkManager, Bluetooth)	launch	~/.local/bin/control-center fix
+Network	nmcli device status	Network devices and their state
+Network	nmcli device wifi list	Visible Wi-Fi networks with signal
+Network	nmcli connection show	Saved connection profiles
+Network	rfkill list	Radio block state (Wi-Fi, Bluetooth)
+Network	ping -c 4 1.1.1.1	Quick internet check
+System	systemctl status thermal-guard	Thermal guard service status and recent actions
+System	sudo wdctl	Hardware watchdog status (freeze auto-reboot)
+System	journalctl -b -1 -p 3	Errors from the previous boot (after a crash)
+System	journalctl -b -1 -p 4 -k	Kernel warnings from the previous boot
+System	sudo ls /var/lib/systemd/pstore	Saved kernel panic logs
+System	systemd-analyze	Boot time
+System	systemd-analyze blame | head -20	Slowest boot services
+System	powerprofilesctl	Current power profile
+Recovery	Alt+SysRq  R E I S U B	Frozen desktop, kernel alive: hold Alt+SysRq, type the letters ~1 s apart (safe reboot)	copy
+Packages	paru -Syu	Update system and AUR packages
+Packages	brew update && brew upgrade	Update Homebrew tools (fish, tmux, nvim, lazygit, gentle-ai...)
+Packages	nvim --headless "+Lazy! sync" +qa	Update Neovim plugins (back up lazy-lock.json first)	copy
+Displays	autorandr --current	Name of the display profile in use
+Displays	autorandr --change	Re-apply the matching display profile
+{{- range (glob (joinPath .chezmoi.homeDir ".config/autorandr/*/config")) }}
+Displays	autorandr --load {{ . | dir | base }}	Load the saved display profile "{{ . | dir | base }}"
+{{- end }}
+Displays	autorandr --save <name>	Save the current layout as a profile	copy
+tmux	tmux ls	List tmux sessions
+tmux	tmux kill-server	Stop every tmux session (needed after a tmux upgrade)
+Gentle AI	gentle-ai version	Installed gentle-ai version
+Gentle AI	gentle-ai review mode status	Receipt-driven review switch (read only)
+Engram	engram tui	Browse persistent memories (TUI)
+Engram	engram search <query>	Search memories from the terminal	copy

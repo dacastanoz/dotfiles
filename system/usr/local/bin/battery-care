@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# battery-care - root helper for the Acer battery health mode (80 % charge cap),
+# calibration mode and automatic power profiles on AC plug / unplug.
+#
+# Usage (root; local active wheel users may run the whitelisted ones through pkexec without a password):
+#   battery-care apply                      re-apply HEALTH_MODE from /etc/battery-care.conf
+#   battery-care health on|off|toggle       change HEALTH_MODE in the config and apply it   [pkexec]
+#   battery-care calibration start|stop     start (AC required) / stop calibration mode     [pkexec]
+#   battery-care ac-event                   AC plugged/unplugged: switch the PPD profile
+#   battery-care boot                       apply + ac-event (boot / resume service)
+#   battery-care restore-profile <profile> <ac 0|1>
+#                                           print the profile thermal-guard should restore
+#   battery-care status                     print key=value state (no root needed)
+#
+# Config /etc/battery-care.conf (key=value, never sourced):
+#   HEALTH_MODE=1            1 = cap charge at 80 % (firmware health mode)
+#   AUTO_PROFILE=1           1 = power-saver on battery, AC profile when plugged
+#   BATTERY_PROFILE=power-saver
+#   AC_PROFILE=balanced      used when no AC choice has been recorded yet
+# The AC choice is recorded in /var/lib/battery-care/ac-profile: the profile that was
+# active when the charger was unplugged (the user's last choice on AC).
+#
+# Coordination with thermal-guard: while /run/thermal-guard/state has level>0 the
+# ac-event does not touch the profile; thermal-guard asks `restore-profile` which
+# profile to restore when it recovers, so the result matches the current AC state.
+#
+# Test overrides (ignored when started through pkexec):
+#   BATTERY_CARE_CONF, BATTERY_CARE_WMI (driver dir), BATTERY_CARE_AC (fake 0/1),
+#   BATTERY_CARE_STATEDIR, BATTERY_CARE_RUNDIR, BATTERY_CARE_TG_STATE,
+#   BATTERY_CARE_PROFILE (fake current profile), BATTERY_CARE_DRYRUN=1 (log instead of
+#   calling powerprofilesctl / writing sysfs)
+set -u
+umask 022
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+
+CONF=/etc/battery-care.conf
+WMI=/sys/bus/wmi/drivers/acer-wmi-battery
+# First mains adapter (ACAD, AC, ADP1, ...), detected instead of hard-coded.
+AC_ONLINE=/sys/class/power_supply/AC/online
+for _ps in /sys/class/power_supply/*; do
+    if [[ -r $_ps/type && $(<"$_ps/type") == Mains ]]; then AC_ONLINE=$_ps/online; break; fi
+done
+unset _ps
+STATEDIR=/var/lib/battery-care
+RUNDIR=/run/battery-care
+TG_STATE=/run/thermal-guard/state
+FAKE_AC="" FAKE_PROFILE="" DRYRUN=0
+if [[ -z ${PKEXEC_UID:-} ]]; then
+    CONF=${BATTERY_CARE_CONF:-$CONF}
+    WMI=${BATTERY_CARE_WMI:-$WMI}
+    STATEDIR=${BATTERY_CARE_STATEDIR:-$STATEDIR}
+    RUNDIR=${BATTERY_CARE_RUNDIR:-$RUNDIR}
+    TG_STATE=${BATTERY_CARE_TG_STATE:-$TG_STATE}
+    FAKE_AC=${BATTERY_CARE_AC:-}
+    FAKE_PROFILE=${BATTERY_CARE_PROFILE:-}
+    DRYRUN=${BATTERY_CARE_DRYRUN:-0}
+fi
+PROFILES=" performance balanced power-saver "
+
+log() { printf 'battery-care: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+valid_profile() { [[ $1 =~ ^[a-z-]+$ && $PROFILES == *" $1 "* ]]; }
+
+# conf_get <KEY> <default>: read one key without sourcing the file.
+conf_get() {
+    local key val
+    if [[ -r $CONF ]]; then
+        while IFS='=' read -r key val; do
+            key=${key//[[:space:]]/}; val=${val//[[:space:]\"\']/}
+            [[ $key == "$1" ]] && { printf '%s\n' "$val"; return 0; }
+        done <"$CONF"
+    fi
+    printf '%s\n' "$2"
+}
+
+# conf_set <KEY> <value>: replace or append the key, atomically.
+conf_set() {
+    local tmp
+    tmp=$(mktemp "${CONF}.XXXXXX") || die "cannot write $CONF"
+    if [[ -r $CONF ]] && grep -q "^[[:space:]]*$1[[:space:]]*=" "$CONF"; then
+        sed "s|^[[:space:]]*$1[[:space:]]*=.*|$1=$2|" "$CONF" >"$tmp"
+    else
+        { [[ -r $CONF ]] && cat "$CONF"; printf '%s=%s\n' "$1" "$2"; } >"$tmp"
+    fi
+    chmod 0644 "$tmp" && mv -f "$tmp" "$CONF"
+}
+
+ac_online() {
+    local v=1
+    if [[ -n $FAKE_AC ]]; then v=$FAKE_AC
+    elif [[ -r $AC_ONLINE ]]; then read -r v <"$AC_ONLINE"; fi
+    [[ $v == 1 ]]
+}
+
+sysfs_read() { local v=""; [[ -r $WMI/$1 ]] && read -r v <"$WMI/$1"; printf '%s\n' "$v"; }
+
+sysfs_write() { # sysfs_write <file> <0|1>
+    if [[ $DRYRUN == 1 ]]; then log "DRYRUN would write $2 > $WMI/$1"; return 0; fi
+    printf '%s\n' "$2" >"$WMI/$1" 2>/dev/null
+}
+
+wait_driver() { # the module may still be loading at boot
+    local i
+    for ((i = 0; i < 20; i++)); do
+        [[ -e $WMI/health_mode ]] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+tg_level() { # thermal-guard level (0 when not running)
+    local key val level=0
+    if [[ -r $TG_STATE ]]; then
+        while IFS='=' read -r key val; do [[ $key == level ]] && level=$val; done <"$TG_STATE"
+    fi
+    [[ $level =~ ^[0-9]+$ ]] || level=0
+    printf '%s\n' "$level"
+}
+
+tg_saved_profile() {
+    local key val p=""
+    [[ -r $TG_STATE ]] || return 0
+    while IFS='=' read -r key val; do [[ $key == saved_profile ]] && p=$val; done <"$TG_STATE"
+    valid_profile "$p" && printf '%s\n' "$p"
+    return 0
+}
+
+current_profile() {
+    if [[ -n $FAKE_PROFILE ]]; then printf '%s\n' "$FAKE_PROFILE"; return; fi
+    powerprofilesctl get 2>/dev/null || echo balanced
+}
+
+set_profile() {
+    valid_profile "$1" || { log "invalid profile '$1'"; return 1; }
+    if [[ $DRYRUN == 1 ]]; then log "DRYRUN would run: powerprofilesctl set $1"; return 0; fi
+    powerprofilesctl set "$1" || { log "could not set profile $1"; return 1; }
+    log "power profile -> $1"
+}
+
+ac_choice() { # recorded AC profile, else config default
+    local p=""
+    [[ -r $STATEDIR/ac-profile ]] && read -r p <"$STATEDIR/ac-profile"
+    valid_profile "$p" || p=$(conf_get AC_PROFILE balanced)
+    valid_profile "$p" || p=balanced
+    printf '%s\n' "$p"
+}
+
+battery_profile() {
+    local p; p=$(conf_get BATTERY_PROFILE power-saver)
+    valid_profile "$p" || p=power-saver
+    printf '%s\n' "$p"
+}
+
+# --- commands ------------------------------------------------------------------------
+cmd_apply() {
+    local want cur
+    want=$(conf_get HEALTH_MODE 1)
+    [[ $want == 0 ]] || want=1
+    wait_driver || die "acer-wmi-battery driver not loaded ($WMI)"
+    if [[ $(sysfs_read calibration_mode) == 1 ]]; then
+        log "calibration running: health mode left alone"; return 0
+    fi
+    cur=$(sysfs_read health_mode)
+    if [[ $cur == "$want" ]]; then log "health_mode already $want"; return 0; fi
+    sysfs_write health_mode "$want" || die "could not write health_mode"
+    log "health_mode $cur -> $want"
+}
+
+cmd_health() {
+    local want
+    case ${1:-} in
+        on) want=1 ;;
+        off) want=0 ;;
+        toggle) [[ $(conf_get HEALTH_MODE 1) == 0 ]] && want=1 || want=0 ;;
+        *) die "usage: battery-care health on|off|toggle" ;;
+    esac
+    conf_set HEALTH_MODE "$want"
+    cmd_apply
+    printf 'HEALTH_MODE=%s\n' "$want"
+}
+
+cmd_calibration() {
+    wait_driver || die "acer-wmi-battery driver not loaded"
+    case ${1:-} in
+        start)
+            ac_online || die "connect the charger first: calibration needs AC power"
+            sysfs_write calibration_mode 1 || die "could not start calibration"
+            log "calibration started (health mode is disabled by the firmware while it runs)" ;;
+        stop)
+            sysfs_write calibration_mode 0 || die "could not stop calibration"
+            log "calibration stopped"
+            cmd_apply ;;
+        *) die "usage: battery-care calibration start|stop" ;;
+    esac
+}
+
+cmd_ac_event() {
+    local now prev="" level cur target
+    [[ $(conf_get AUTO_PROFILE 1) == 1 ]] || { log "AUTO_PROFILE=0: nothing to do"; return 0; }
+    mkdir -p "$RUNDIR" "$STATEDIR"
+    exec 9>"$RUNDIR/lock"
+    flock -w 20 9 || die "lock busy"
+    if ac_online; then now=1; else now=0; fi
+    [[ -r $RUNDIR/ac ]] && read -r prev <"$RUNDIR/ac"
+    if [[ $prev == "$now" ]]; then log "AC state unchanged ($now): nothing to do"; return 0; fi
+    level=$(tg_level)
+    if [[ $now == 0 && -n $prev ]]; then
+        # Unplugged: remember the profile the user had on AC.
+        if (( level > 0 )); then cur=$(tg_saved_profile); else cur=$(current_profile); fi
+        if valid_profile "${cur:-}"; then
+            printf '%s\n' "$cur" >"$STATEDIR/ac-profile.tmp" && mv -f "$STATEDIR/ac-profile.tmp" "$STATEDIR/ac-profile"
+        fi
+    fi
+    printf '%s\n' "$now" >"$RUNDIR/ac"
+    if (( level > 0 )); then
+        log "thermal-guard level $level: profile left to thermal-guard (AC=$now)"; return 0
+    fi
+    if [[ $now == 0 ]]; then target=$(battery_profile)
+    elif [[ -n $prev ]]; then target=$(ac_choice)
+    else log "boot on AC: keeping the current profile"; return 0; fi
+    [[ $(current_profile) == "$target" ]] && { log "profile already $target"; return 0; }
+    set_profile "$target"
+}
+
+cmd_restore_profile() { # <saved profile> <saved ac>: print profile for thermal-guard
+    local saved=${1:-balanced} saved_ac=${2:-}
+    valid_profile "$saved" || saved=balanced
+    if [[ $(conf_get AUTO_PROFILE 1) != 1 ]]; then printf '%s\n' "$saved"; return 0; fi
+    if ! ac_online; then battery_profile
+    elif [[ $saved_ac != 0 ]]; then printf '%s\n' "$saved"
+    else ac_choice; fi
+}
+
+cmd_status() {
+    local ac=0
+    ac_online && ac=1
+    printf 'health_mode_conf=%s\n' "$(conf_get HEALTH_MODE 1)"
+    printf 'health_mode=%s\n' "$(sysfs_read health_mode)"
+    printf 'calibration_mode=%s\n' "$(sysfs_read calibration_mode)"
+    printf 'battery_temp_mc=%s\n' "$(sysfs_read temperature)"
+    printf 'driver=%s\n' "$([[ -e $WMI/health_mode ]] && echo loaded || echo missing)"
+    printf 'auto_profile=%s\nac=%s\nac_profile=%s\nbattery_profile=%s\n' \
+        "$(conf_get AUTO_PROFILE 1)" "$ac" "$(ac_choice)" "$(battery_profile)"
+}
+
+need_root() { [[ $EUID == 0 || $DRYRUN == 1 ]] || die "must run as root (pkexec battery-care $*)"; }
+
+# Through pkexec only the user-facing commands are allowed.
+if [[ -n ${PKEXEC_UID:-} ]]; then
+    case ${1:-} in health|calibration|apply|status) ;; *) die "command not allowed via pkexec" ;; esac
+fi
+
+case ${1:-} in
+    apply)           need_root "$@"; cmd_apply ;;
+    health)          need_root "$@"; cmd_health "${2:-}" ;;
+    calibration)     need_root "$@"; cmd_calibration "${2:-}" ;;
+    ac-event)        need_root "$@"; cmd_ac_event ;;
+    boot)            need_root "$@"; (cmd_apply) || true; cmd_ac_event ;; # no Acer driver: profiles only
+    restore-profile) cmd_restore_profile "${2:-}" "${3:-}" ;;
+    status)          cmd_status ;;
+    *) die "usage: battery-care apply|health on|off|toggle|calibration start|stop|ac-event|boot|restore-profile <p> <ac>|status" ;;
+esac

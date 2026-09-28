@@ -1,0 +1,10 @@
+[Unit]
+Description=Reapply ryzenadj limits periodically (firmware resets them on suspend/AC changes)
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=60
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target

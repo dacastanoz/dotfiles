@@ -1,0 +1,17 @@
+{{- /* Emits "absdir|~dir|label" lines from the machine-local drive-sync config (if any). */ -}}
+{{- $rc := joinPath .chezmoi.homeDir ".config/drive-sync/remotes.conf" -}}
+{{- if stat $rc -}}
+{{- range (include $rc | splitList "\n") -}}
+{{- $line := trim . -}}
+{{- if and (ne $line "") (not (hasPrefix "#" $line)) -}}
+{{- $f := splitList "|" $line -}}
+{{- if ge (len $f) 3 -}}
+{{- $dir := index $f 2 | replace "$HOME" "~" -}}
+{{- $abs := $dir | replace "~" $.chezmoi.homeDir -}}
+{{- $label := index $f 0 -}}
+{{- if ge (len $f) 4 }}{{ $label = index $f 3 }}{{ end -}}
+{{ $abs }}|{{ $dir }}|{{ $label }}
+{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

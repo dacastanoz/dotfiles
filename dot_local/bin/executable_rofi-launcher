@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Application launcher: rofi drun mode with icons (Nord theme from config.rasi).
+# Toggle behaviour: pressing the key again while rofi is open closes it.
+if pgrep -x rofi >/dev/null 2>&1; then
+    pkill -x rofi
+    exit 0
+fi
+exec rofi -show drun -show-icons

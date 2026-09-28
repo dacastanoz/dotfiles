@@ -1,0 +1,87 @@
+# Official / CachyOS repository packages for the i3 desktop (one per line, # comments allowed).
+# Hardware-specific packages (Bluetooth, ryzenadj, battery drivers) are added by
+# run_once_before_00-packages.sh only on machines that need them.
+
+# Window manager, bar, launcher, notifications, compositor, terminal
+i3-wm
+i3lock
+polybar
+rofi
+dunst
+libnotify
+picom
+ghostty
+dex
+xidlehook-placeholder-see-aur
+feh
+maim
+xclip
+xob
+pamixer
+brightnessctl
+playerctl
+xorg-xrandr
+xorg-xset
+xorg-xdpyinfo
+
+# Displays
+autorandr
+arandr
+
+# Network, audio, power
+network-manager-applet
+nm-connection-editor
+pavucontrol
+pipewire-pulse
+wireplumber
+power-profiles-daemon
+lm_sensors
+qrencode
+zbar
+
+# Files
+thunar
+thunar-archive-plugin
+thunar-media-tags-plugin
+thunar-volman
+tumbler
+ffmpegthumbnailer
+file-roller
+gvfs
+gvfs-mtp
+gvfs-smb
+gvfs-gphoto2
+udiskie
+yazi
+chafa
+rclone
+
+# Look and feel
+papirus-icon-theme
+capitaine-cursors
+cachyos-nord-gtk-theme-git
+ttf-jetbrains-mono-nerd
+ttf-fira-sans
+
+# Keyring, polkit, misc apps
+gnome-keyring
+libsecret
+seahorse
+polkit-gnome
+gnome-calculator
+btop
+imagemagick
+xdg-utils
+xdg-user-dirs
+desktop-file-utils
+pacman-contrib
+
+# CLI tools used by the scripts
+ripgrep
+fd
+bat
+eza
+sd
+jq
+fzf
+shellcheck

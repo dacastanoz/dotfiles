@@ -1,0 +1,37 @@
+{{- /*
+  Machine detection. Everything here is computed from the hardware, no prompts.
+  Re-run `chezmoi init` after a hardware change (e.g. new Bluetooth dongle) to refresh it.
+  Any value can be overridden per machine in ~/.config/chezmoi/chezmoi.toml ([data] section)
+  after init, but `chezmoi init` regenerates that file from this template.
+*/ -}}
+{{- $sh := "sh" -}}
+{{- $battery := output $sh "-c" "for b in /sys/class/power_supply/*; do [ \"$(cat \"$b/type\" 2>/dev/null)\" = Battery ] && { basename \"$b\"; break; }; done; true" | trim -}}
+{{- $adapter := output $sh "-c" "for b in /sys/class/power_supply/*; do [ \"$(cat \"$b/type\" 2>/dev/null)\" = Mains ] && { basename \"$b\"; break; }; done; true" | trim -}}
+{{- $wifi := output $sh "-c" "for d in /sys/class/net/*; do [ -e \"$d/wireless\" ] && { basename \"$d\"; break; }; done; true" | trim -}}
+{{- $bt := output $sh "-c" "ls /sys/class/bluetooth 2>/dev/null | head -n1; true" | trim -}}
+{{- $vendor := output $sh "-c" "grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | awk '{print $3}'; true" | trim -}}
+{{- $sensor := output $sh "-c" "for h in /sys/class/hwmon/hwmon*; do n=$(cat \"$h/name\" 2>/dev/null); case $n in k10temp|coretemp|zenpower) echo \"$n\"; break;; esac; done; true" | trim -}}
+{{- $amdgpu := output $sh "-c" "grep -qx 0x1002 /sys/class/drm/card*/device/vendor 2>/dev/null && echo yes; true" | trim -}}
+{{- $limine := output $sh "-c" "[ -f /etc/default/limine ] && echo yes; true" | trim -}}
+{{- $sysVendor := output $sh "-c" "cat /sys/class/dmi/id/sys_vendor 2>/dev/null; true" | trim -}}
+{{- $hasBattery := ne $battery "" -}}
+{{- $hasRyzen := eq $vendor "AuthenticAMD" -}}
+{{- $sensorLabel := "Tctl" -}}
+{{- if eq $sensor "coretemp" -}}{{- $sensorLabel = "Package id 0" -}}{{- end -}}
+{{- if eq $sensor "zenpower" -}}{{- $sensorLabel = "Tdie" -}}{{- end -}}
+
+[data]
+    hasBattery = {{ $hasBattery }}
+    batteryName = {{ $battery | quote }}
+    adapterName = {{ $adapter | quote }}
+    hasWifi = {{ ne $wifi "" }}
+    hasBluetooth = {{ ne $bt "" }}
+    cpuVendor = {{ $vendor | quote }}
+    hasRyzen = {{ $hasRyzen }}
+    isAMDLaptop = {{ and $hasRyzen $hasBattery }}
+    hasAMDGPU = {{ eq $amdgpu "yes" }}
+    hasLimine = {{ eq $limine "yes" }}
+    cpuSensor = {{ $sensor | quote }}
+    cpuSensorLabel = {{ $sensorLabel | quote }}
+    sysVendor = {{ $sysVendor | quote }}
+    isAcerLaptop = {{ and $hasBattery (hasPrefix "Acer" $sysVendor) }}

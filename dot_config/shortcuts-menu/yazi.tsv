@@ -1,0 +1,24 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+Move	h / j / k / l	Parent / down / up / enter
+Move	g g / G	Top / bottom
+Move	z / Z	Jump with zoxide / fzf
+Open	Enter / o	Open (text in Neovim, others with xdg-open)
+Open	O	Open with... (pick a program)
+Select	Space	Select file
+Select	v	Visual selection mode
+Select	Ctrl+A	Select all
+Files	a	Create file (end with / for a folder)
+Files	r	Rename
+Files	y / x / p	Copy / cut / paste
+Files	d / D	Trash / delete permanently
+Files	c c / c d / c f	Copy path / folder / file name
+View	.	Show / hide hidden files
+View	,	Sort options
+Search	/	Find in the current folder
+Search	s / S	Search file names (fd) / contents (rg)
+Tabs	t / 1..9	New tab / go to tab
+Shell	;	Run a shell command here
+Quit	q	Quit (in fish, `y` leaves you in the last folder)
+Help	F1 / ~	All yazi keys

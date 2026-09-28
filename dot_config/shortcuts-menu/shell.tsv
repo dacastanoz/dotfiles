@@ -1,0 +1,20 @@
+# Columns (TAB separated): section, key or command, description[, kind[, action]].
+# kind: copy (default: info only, Enter copies the key/command), term (runs in a ghostty popup), launch (starts a program).
+# In tmux.tsv, <prefix> is replaced with the prefix read from ~/.tmux.conf.
+History	Ctrl+R	Search command history (fzf)
+History	Up	Full-screen history search (atuin)
+History	? (vi normal mode)	Ask atuin AI for a command
+History	atuin stats	Most used commands	term
+fzf	Ctrl+T	Insert a file path picked with fzf
+fzf	Alt+C	cd into a folder picked with fzf
+fzf	Shift+Tab	fzf completion
+fzf	fzfbat	fzf with bat preview
+Jump	z <part of a path>	Jump to a frequent folder (zoxide)
+Jump	zi	Pick a folder interactively (zoxide + fzf)
+Jump	y	yazi; quitting with q leaves you in its last folder
+Jump	pj <project>	Jump to a project folder
+fish	Esc	Vi normal mode (i to insert again)
+fish	Right / Ctrl+F	Accept the autosuggestion
+fish	Alt+E	Edit the command line in the editor
+fish	Tab	Completions (carapace)
+Apps	notion / whatsapp / chrome	Open these apps from the terminal

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Pick a project folder with zoxide (fzf) and open Neovim there.
+# Used by the i3 binding $mod+o; usable from any terminal too.
+set -euo pipefail
+dir=$(zoxide query --interactive -- "$@") || exit 0
+cd -- "$dir"
+exec nvim
