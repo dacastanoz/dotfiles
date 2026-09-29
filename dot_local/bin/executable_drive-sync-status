@@ -1,43 +1,69 @@
 #!/bin/bash
-# drive-sync-status: short status line for polybar + click menu for drive-sync.
+# drive-sync-status: polybar status + rofi menu for drive-sync (rclone bisync).
 #
 # Usage:
-#   drive-sync-status           polybar-formatted status (Nerd Font icon + text, Nord colors)
-#   drive-sync-status --plain   same without polybar color tags
-#   drive-sync-status --long    per-remote details (for terminals / rofi message)
-#   drive-sync-status --click   rofi menu: sync now, open log, open folder, resync a remote
+#   drive-sync-status                  polybar-formatted status line (one shot)
+#   drive-sync-status --tail           polybar tail mode: redraws every 2 s while a sync
+#                                      runs (progress %), every 20 s otherwise; SIGUSR1 = now
+#   drive-sync-status --plain          status line without polybar color tags
+#   drive-sync-status --long           per-remote details (terminal / rofi message)
+#   drive-sync-status --click          rofi menu (sync now, pending, verify, evidence, logs)
+#   drive-sync-status --pending NAME   print "new modified deleted" local changes not yet synced
+#   drive-sync-status --check-remote [NAME]
+#                                      list Drive (read-only, no lock) and store the Drive-side
+#                                      pending counts in ~/.local/state/drive-sync/NAME.remote
+#   drive-sync-status --details NAME   rofi view: last sync evidence (counts + changed paths)
+#
+# Pending counts:
+#   local  = current files under the local folder vs bisync's saved listing (path2.lst):
+#            new = not in listing, deleted = in listing but gone, modified = size/mtime differ
+#            (only files changed since the last run are stat'ed). Cached 60 s in
+#            $XDG_RUNTIME_DIR/drive-sync/NAME.local.
+#   Drive  = set to 0 after every successful sync, exact after "Verify now" (bisync dry-run),
+#            or measured by --check-remote (one recursive listing vs path1.lst).
 #
 # polybar:
-#   [module/drive]
+#   [module/drive-sync]
 #   type = custom/script
-#   exec = ~/.local/bin/drive-sync-status
-#   interval = 15
+#   exec = ~/.local/bin/bar-errors tail drive-sync ~/.local/bin/drive-sync-status --tail
+#   tail = true
 #   click-left = ~/.local/bin/drive-sync-status --click &
 
 set -u
 export LC_ALL=C.UTF-8
+export LC_TIME=C
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drive-sync"
+RUNS_DIR="$STATE_DIR/runs"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/drive-sync"
+PROGRESS="$RUN_DIR/progress"
+NOTIFY_FLAG="$RUN_DIR/notify-when-done"
 LOGFILE="$HOME/.local/share/rclone/bisync.log"
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/drive-sync-${UID}.lock"
-TERMINAL="${TERMINAL:-ghostty}"
+FILTERS="$HOME/.config/rclone/bisync-filters.txt"
+BISYNC_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rclone/bisync"
 REMOTES_CONF="${DRIVE_SYNC_REMOTES:-${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync/remotes.conf}"
+TERMINAL="${TERMINAL:-ghostty}"
+LOCAL_TTL=60
+DETAIL_ROWS=20
 
-# Remote names and the folder opened by "Open Drive folder" (parent of the first local folder)
-# come from the machine-local remotes.conf used by drive-sync.
+# Remote names, rclone remotes and local folders come from the machine-local remotes.conf
+# used by drive-sync. "Open Drive folder" opens the parent of the first local folder.
 NAMES=()
+declare -A RDIR=() RREMOTE=()
 DRIVE_DIR="$HOME"
 if [ -r "$REMOTES_CONF" ]; then
-    while IFS='|' read -r r_name _ r_dir _; do
+    while IFS='|' read -r r_name r_remote r_dir _; do
         case "$r_name" in ''|'#'*) continue ;; esac
-        if [ "${#NAMES[@]}" -eq 0 ] && [ -n "$r_dir" ]; then
-            case "$r_dir" in
-                \~/*) r_dir="$HOME/${r_dir#\~/}" ;;
-                \$HOME*) r_dir="$HOME${r_dir#\$HOME}" ;;
-            esac
-            DRIVE_DIR=$(dirname "$r_dir")
-        fi
+        case "$r_dir" in
+            \~) r_dir=$HOME ;;
+            \~/*) r_dir="$HOME/${r_dir#\~/}" ;;
+            \$HOME*) r_dir="$HOME${r_dir#\$HOME}" ;;
+        esac
+        [ "${#NAMES[@]}" -eq 0 ] && [ -n "$r_dir" ] && DRIVE_DIR=$(dirname "$r_dir")
         NAMES+=("$r_name")
+        RDIR[$r_name]=$r_dir
+        RREMOTE[$r_name]=$r_remote
     done <"$REMOTES_CONF"
 fi
 
@@ -66,13 +92,181 @@ ago() { # epoch -> "5m" / "3h" / "2d" / "never"
     else echo "$((d / 86400))d"; fi
 }
 
+ago_long() { # epoch -> "3m ago (19:42)" / "never"
+    local t="${1:-0}" a fmt='%H:%M'
+    [ "$t" -gt 0 ] 2>/dev/null || { echo never; return; }
+    a=$(ago "$t")
+    [ $(( $(date +%s) - t )) -ge 86400 ] && fmt='%d %b %H:%M'
+    if [ "$a" = now ]; then echo "just now ($(date -d "@$t" +"$fmt"))"
+    else echo "$a ago ($(date -d "@$t" +"$fmt"))"; fi
+}
+
+fmt_duration() { # seconds -> "1m04s" / "12s"
+    local s="${1:-0}"
+    [ "$s" -ge 0 ] 2>/dev/null || { echo "?"; return; }
+    if [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s / 60)) $((s % 60)); else printf '%ds' "$s"; fi
+}
+
+esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+notify() { # title body [urgency]
+    notify-send -a "Drive sync" -u "${3:-normal}" -i folder-cloud "$1" "$2" 2>/dev/null || true
+}
+
 is_syncing() {
     [ -e "$LOCKFILE" ] || return 1
     ! flock -n "$LOCKFILE" true 2>/dev/null
 }
 
+refresh_bar() { pkill -USR1 -f '^[^ ]*bash [^ ]*/drive-sync-status --tail$' 2>/dev/null || true; }
+
+# bisync keeps its listings as <path1>..<path2>.path{1,2}.lst; path2 = the local folder
+# with "/" -> "_" (leading "/" dropped).
+listing_file() { # name 1|2
+    local dir="${RDIR[$1]:-}" key f
+    [ -n "$dir" ] || return 1
+    key="${dir#/}"; key="${key%/}"; key="${key//\//_}"
+    for f in "$BISYNC_CACHE"/*.."$key".path"$2".lst; do
+        [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+# fd exclude flags from the "- pattern" lines of the bisync filters file.
+filter_excludes() {
+    local line
+    [ -r "$FILTERS" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in "- "*) printf '%s\0%s\0' -E "${line#- }" ;; esac
+    done <"$FILTERS"
+}
+
+# awk helpers shared by the local and Drive comparisons: listing lines look like
+#   -  3665138 - - 2026-02-26T15:31:31.000000000+0000 "dir/file.pdf"
+LISTING_AWK='
+function lst_epoch(t) {   # 2026-02-26T15:31:31.000000000+0000 (UTC)
+    return mktime(substr(t,1,4) " " substr(t,6,2) " " substr(t,9,2) " " substr(t,12,2) " " substr(t,15,2) " " substr(t,18,2), 1)
+}
+function lst_path(line,   p) {
+    p = substr(line, index(line, "\"") + 1); sub(/"$/, "", p)
+    gsub(/\\"/, "\"", p); gsub(/\\\\/, "\\", p)
+    return p
+}'
+
+# Local changes since the last sync: prints "new modified deleted" (or "? ? ?").
+count_local() { # name
+    local name="$1" dir="${RDIR[$1]:-}" lst since dur excl=()
+    lst=$(listing_file "$name" 2) || { echo "? ? ?"; return; }
+    [ -d "$dir" ] || { echo "? ? ?"; return; }
+    mapfile -d '' excl < <(filter_excludes)
+    dur=$(jq -r '.duration // 3600' "$STATE_DIR/$name.last.json" 2>/dev/null)
+    [ "$dur" -ge 0 ] 2>/dev/null || dur=3600
+    since=$(( $(stat -c %Y "$lst") - dur - 300 ))
+    awk -F'\t' "$LISTING_AWK"'
+        FILENAME == ARGV[1] {                 # saved listing
+            if ($0 ~ /^#/ || $0 == "") next
+            split($0, f, " "); p = lst_path($0)
+            size[p] = f[2]; mt[p] = lst_epoch(f[5]); next
+        }
+        FILENAME == ARGV[2] {                 # current files (relative paths)
+            seen[$0] = 1; if (!($0 in size)) new++; next
+        }
+        {                                     # size<TAB>mtime<TAB>abs path of recent files
+            p = substr($3, length(dir) + 2)
+            if ((p in size) && ((size[p] != -1 && size[p] != $1) || ($2 - mt[p] > 1 || mt[p] - $2 > 1))) mod++
+        }
+        END {
+            for (p in size) if (!(p in seen)) del++
+            printf "%d %d %d\n", new, mod, del
+        }' "$lst" \
+        <(cd "$dir" && fd -H -t f --no-ignore "${excl[@]}" --strip-cwd-prefix . 2>/dev/null) \
+        <(fd -H -t f --no-ignore "${excl[@]}" --changed-after "@$since" . "$dir" -0 2>/dev/null \
+            | xargs -0 -r stat -c '%s	%Y	%n' 2>/dev/null)
+}
+
+# Cached wrapper (TTL 60 s; drive-sync deletes the cache after a successful sync).
+# Prints "new modified deleted computed_at".
+local_pending() { # name
+    local f="$RUN_DIR/$1.local" now line
+    now=$(date +%s)
+    if [ -s "$f" ]; then
+        line=$(<"$f")
+        # While this remote is syncing its listing may be half written: keep the cache.
+        if [ $((now - ${line##* })) -lt "$LOCAL_TTL" ] || { is_syncing && [ "$(status_get "$PROGRESS" remote)" = "$1" ]; }; then
+            echo "$line"; return
+        fi
+    fi
+    mkdir -p "$RUN_DIR"
+    line="$(count_local "$1") $now"
+    printf '%s\n' "$line" >"$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
+    echo "$line"
+}
+
+# Drive-side pending by listing the remote (read-only, no bisync lock).
+check_remote() { # name
+    local name="$1" remote="${RREMOTE[$1]:-}" lst out tmp
+    [ -n "$remote" ] || return 1
+    lst=$(listing_file "$name" 1) || { echo "no bisync listing yet"; return 1; }
+    tmp=$(mktemp) || return 1
+    if ! TZ=UTC rclone lsf -R --files-only --format tsp --separator $'\t' \
+        --time-format '2006-01-02 15:04:05' --filter-from "$FILTERS" "$remote" >"$tmp" 2>/dev/null; then
+        rm -f "$tmp"; return 1
+    fi
+    out=$(awk -F'\t' "$LISTING_AWK"'
+            FILENAME == ARGV[1] {
+                if ($0 ~ /^#/ || $0 == "") next
+                split($0, f, " "); p = lst_path($0)
+                size[p] = f[2]; mt[p] = lst_epoch(f[5]); next
+            }
+            {
+                t = $1; gsub(/[-:]/, " ", t); e = mktime(t, 1)
+                p = $3; seen[p] = 1
+                if (!(p in size)) new++
+                else if ((size[p] != -1 && $2 != -1 && size[p] != $2) || (e - mt[p] > 1 || mt[p] - e > 1)) mod++
+            }
+            END { for (p in size) if (!(p in seen)) del++; printf "%d %d %d\n", new, mod, del }' "$lst" "$tmp")
+    rm -f "$tmp"
+    [ -n "$out" ] || return 1
+    local cn cm cd
+    read -r cn cm cd <<<"$out"
+    printf 'checked_at=%s\nnew=%s\nmodified=%s\ndeleted=%s\nsource=check\n' "$(date +%s)" "$cn" "$cm" "$cd" \
+        >"$STATE_DIR/$name.remote.tmp.$$" && mv -f "$STATE_DIR/$name.remote.tmp.$$" "$STATE_DIR/$name.remote"
+    echo "$cn $cm $cd"
+}
+
+sum3() { echo $(( ${1:-0} + ${2:-0} + ${3:-0} )); }
+
+# Short progress text from the progress file: "1/3 my_drive 45%" / "my_drive listing".
+progress_text() {
+    local remote idx total phase pct t
+    remote=$(status_get "$PROGRESS" remote)
+    idx=$(status_get "$PROGRESS" index)
+    total=$(status_get "$PROGRESS" total)
+    phase=$(status_get "$PROGRESS" phase)
+    pct=$(status_get "$PROGRESS" percent)
+    t="$remote"
+    [ "${total:-1}" -gt 1 ] 2>/dev/null && t="$idx/$total $t"
+    if [ -n "$pct" ]; then t="$t $pct%"; else t="$t ${phase:-starting}"; fi
+    printf '%s' "$t"
+}
+
+progress_long() { # one line for the menu header
+    local remote idx total phase pct bd bt eta fd ft started
+    remote=$(status_get "$PROGRESS" remote); idx=$(status_get "$PROGRESS" index)
+    total=$(status_get "$PROGRESS" total); phase=$(status_get "$PROGRESS" phase)
+    pct=$(status_get "$PROGRESS" percent); bd=$(status_get "$PROGRESS" bytes_done)
+    bt=$(status_get "$PROGRESS" bytes_total); eta=$(status_get "$PROGRESS" eta)
+    fd=$(status_get "$PROGRESS" files_done); ft=$(status_get "$PROGRESS" files_total)
+    started=$(status_get "$PROGRESS" started)
+    printf 'Syncing %s (%s/%s): %s' "$remote" "$idx" "$total" "${phase:-starting}"
+    [ -n "$pct" ] && printf ' %s%% · %s / %s · ETA %s' "$pct" "$bd" "$bt" "$eta"
+    [ "${ft:-0}" -gt 0 ] 2>/dev/null && printf ' · files %s/%s' "$fd" "$ft"
+    [ -n "$started" ] && printf ' · running %s' "$(fmt_duration $(( $(date +%s) - started )))"
+    echo
+}
+
 print_status() { # plain(0/1)
-    local plain="$1" icon color text n st worst="" oldest_ok=0 all_offline=1 last_ok
+    local plain="$1" icon color text n st worst="" oldest_ok=0 all_offline=1 last_ok up=0 down=0 ln lm ld rn rmod rd
     for n in "${NAMES[@]}"; do
         st=$(status_get "$STATE_DIR/$n.status" state)
         last_ok=$(status_get "$STATE_DIR/$n.status" last_ok)
@@ -87,9 +281,11 @@ print_status() { # plain(0/1)
         fi
     done
 
-    if is_syncing; then
+    if is_syncing && [ -f "$PROGRESS" ]; then
+        icon="$ICON_SYNC" color="$C_SYNC" text="$(progress_text)"
+    elif is_syncing; then
         icon="$ICON_SYNC" color="$C_SYNC" text="sync"
-    elif [ ! -d "$STATE_DIR" ] || [ -z "$(fd -e status . "$STATE_DIR" 2>/dev/null)" ]; then
+    elif [ "${#NAMES[@]}" -eq 0 ] || [ ! -d "$STATE_DIR" ] || [ -z "$(fd -e status . "$STATE_DIR" 2>/dev/null)" ]; then
         icon="$ICON_OFF" color="$C_OFF" text="n/a"
     elif [ "$all_offline" -eq 1 ]; then
         icon="$ICON_OFF" color="$C_OFF" text="offline"
@@ -103,6 +299,16 @@ print_status() { # plain(0/1)
         esac
     else
         icon="$ICON_OK" color="$C_OK" text="$(ago "$oldest_ok")"
+        # Pending changes (local cached 60 s; Drive side as last measured).
+        for n in "${NAMES[@]}"; do
+            read -r ln lm ld _ < <(local_pending "$n")
+            [ "$ln" != "?" ] && up=$((up + $(sum3 "$ln" "$lm" "$ld")))
+            rn=$(status_get "$STATE_DIR/$n.remote" new); rmod=$(status_get "$STATE_DIR/$n.remote" modified)
+            rd=$(status_get "$STATE_DIR/$n.remote" deleted)
+            down=$((down + $(sum3 "$rn" "$rmod" "$rd")))
+        done
+        [ "$up" -gt 0 ] && text="$text ↑$up"
+        [ "$down" -gt 0 ] && text="$text ↓$down"
     fi
 
     if [ "$plain" -eq 1 ]; then
@@ -112,44 +318,238 @@ print_status() { # plain(0/1)
     fi
 }
 
-print_long() {
-    local n f
-    for n in "${NAMES[@]}"; do
-        f="$STATE_DIR/$n.status"
-        printf '%-17s %-16s ok %-6s %s\n' "$n" "$(status_get "$f" state)" \
-            "$(ago "$(status_get "$f" last_ok)")" "$(status_get "$f" message)"
+tail_loop() {
+    local pid="" delay
+    trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null' USR1
+    while :; do
+        print_status 0
+        if is_syncing; then delay=2; else delay=20; fi
+        sleep "$delay" & pid=$!
+        wait "$pid"
+        pid=""
     done
-    is_syncing && echo "(sync in progress)"
+}
+
+# One line per remote: state, last successful sync, duration + counts of the last run,
+# pending local ↑ / Drive ↓ changes.
+remote_line() { # name markup(0/1)
+    local n="$1" markup="$2" f st msg last_ok ln lm ld rn rmod rd rat json dur counts glyph pend
+    f="$STATE_DIR/$n.status"
+    st=$(status_get "$f" state); msg=$(status_get "$f" message); last_ok=$(status_get "$f" last_ok)
+    json="$STATE_DIR/$n.last.json"
+    dur="" counts=""
+    if [ -f "$json" ]; then
+        dur=$(fmt_duration "$(jq -r '.duration' "$json")")
+        counts=$(jq -r '.counts as $c | if ($c.down+$c.up+$c.deleted_local+$c.deleted_drive+$c.conflicts)==0
+            then "no changes" else "↓\($c.down) ↑\($c.up) del \($c.deleted_local+$c.deleted_drive)"
+            + (if $c.conflicts>0 then " conflicts \($c.conflicts)" else "" end) end' "$json")
+    fi
+    read -r ln lm ld _ < <(local_pending "$n")
+    rn=$(status_get "$STATE_DIR/$n.remote" new); rmod=$(status_get "$STATE_DIR/$n.remote" modified)
+    rd=$(status_get "$STATE_DIR/$n.remote" deleted); rat=$(status_get "$STATE_DIR/$n.remote" checked_at)
+    if [ "$ln" = "?" ]; then pend="↑?"; else pend="↑$(sum3 "$ln" "$lm" "$ld")"; fi
+    if [ -n "$rat" ]; then pend="$pend ↓$(sum3 "$rn" "$rmod" "$rd") (Drive checked $(ago "$rat") ago)"
+    else pend="$pend ↓? (Drive not checked)"; fi
+    pend="${pend//checked now ago/checked just now}"
+    case "$st" in
+        ok) glyph="$ICON_OK" ;;
+        offline) glyph="$ICON_OFF" ;;
+        "") glyph="$ICON_OFF"; st="never run" ;;
+        *) glyph="$ICON_ERR" ;;
+    esac
+    if [ "$markup" -eq 1 ]; then
+        local line="$glyph <b>$n</b>  "
+        [ "$st" = ok ] || line="$line<span foreground='$C_ERR'>$st: $(printf '%s' "$msg" | esc)</span> · "
+        line="${line}synced $(ago_long "$last_ok")"
+        [ -n "$dur" ] && line="$line · took $dur · $counts"
+        line="$line · <i>pending $pend</i>"
+        local vres vat
+        vres=$(status_get "$STATE_DIR/$n.verify" result); vat=$(status_get "$STATE_DIR/$n.verify" checked_at)
+        case "$vres" in
+            in-sync) line="$line · <span foreground='$C_OK'>verified in sync $(ago_long "$vat")</span>" ;;
+            differs) line="$line · <span foreground='$C_WARN'>verify $(ago_long "$vat"): differs</span>" ;;
+            error) line="$line · <span foreground='$C_ERR'>verify failed $(ago_long "$vat")</span>" ;;
+        esac
+        [ "$ln" != "?" ] && [ "$(sum3 "$ln" "$lm" "$ld")" -gt 0 ] && line="$line <span foreground='$C_WARN'>(+$ln ~$lm -$ld)</span>"
+        printf '%s\n' "$line"
+    else
+        printf '%-17s %-10s synced %-22s last run %-8s %-22s pending %s\n' "$n" "$st" \
+            "$(ago_long "$last_ok")" "${dur:--}" "${counts:--}" "$pend"
+        [ "$st" = ok ] || printf '%-17s %s\n' "" "$msg"
+    fi
+}
+
+print_long() {
+    local n
+    [ "${#NAMES[@]}" -eq 0 ] && { echo "No remotes configured in $REMOTES_CONF"; return 0; }
+    for n in "${NAMES[@]}"; do remote_line "$n" 0; done
+    if is_syncing; then
+        if [ -f "$PROGRESS" ]; then progress_long; else echo "(sync in progress)"; fi
+    fi
     return 0
 }
 
 term() { # command...
-    setsid -f "$TERMINAL" -e "$@" >/dev/null 2>&1
+    setsid -f "$TERMINAL" --class=dev.gentleman.popup -e "$@" >/dev/null 2>&1
+}
+
+header_mesg() {
+    local next warn=""
+    if is_syncing && [ -f "$PROGRESS" ]; then
+        progress_long | esc
+    elif is_syncing; then
+        echo "Sync in progress"
+    else
+        next=$(systemctl --user show drive-sync.timer -p NextElapseUSecRealtime --value 2>/dev/null)
+        if [ -n "$next" ] && [ "$next" != "n/a" ]; then
+            echo "Idle · next automatic sync $(date -d "$next" +%H:%M 2>/dev/null || echo "$next") (every 10 min)"
+        else
+            echo "Idle · automatic sync timer inactive"
+        fi
+    fi
+    if fd -g '*.shared-client-id' "$STATE_DIR" -q 2>/dev/null; then
+        warn="<span foreground='$C_WARN'>⚠ Remotes use rclone's shared Google client_id: rate limited (slow listings) and being retired in 2026. Create your own client_id (rclone.org/drive/#making-your-own-client-id).</span>"
+        echo "$warn"
+    fi
+}
+
+start_sync() {
+    mkdir -p "$RUN_DIR"
+    : >"$NOTIFY_FLAG"
+    if is_syncing; then
+        notify "Drive sync" "A sync is already running; you'll get a notification when it finishes."
+    else
+        systemctl --user start --no-block drive-sync.service
+        notify "Drive sync" "Sync started" low
+    fi
+    sleep 0.5
+    refresh_bar
+}
+
+start_verify() {
+    if is_syncing; then
+        notify "Drive verify" "A sync is running right now; verify after it finishes." low
+        return
+    fi
+    mkdir -p "$RUN_DIR"
+    : >"$NOTIFY_FLAG"
+    systemd-run --user --collect --quiet --unit="drive-sync-verify-$(date +%s)" -p Nice=10 \
+        "$HOME/.local/bin/drive-sync" --dry-run >/dev/null 2>&1 \
+        || setsid -f "$HOME/.local/bin/drive-sync" --dry-run >/dev/null 2>&1
+    notify "Drive verify" "Comparing Drive and local folders (bisync dry-run, ~1-3 min). Nothing is changed." low
+    sleep 0.5
+    refresh_bar
+}
+
+check_pending_all() {
+    local n body="" r ln lm ld rn rmod rd
+    notify "Drive" "Checking Drive for changes…" low
+    for n in "${NAMES[@]}"; do
+        rm -f "$RUN_DIR/$n.local"
+        read -r ln lm ld _ < <(local_pending "$n")
+        if r=$(check_remote "$n"); then
+            read -r rn rmod rd <<<"$r"
+            body="$body$n: local ↑$(sum3 "$ln" "$lm" "$ld") · Drive ↓$(sum3 "$rn" "$rmod" "$rd") (new $rn, modified $rmod, deleted $rd)"$'\n'
+        else
+            body="$body$n: local ↑$(sum3 "$ln" "$lm" "$ld") · Drive check failed"$'\n'
+        fi
+    done
+    notify "Pending changes" "$body"
+    refresh_bar
+}
+
+pick_remote() { # prompt
+    printf '%s\n' "${NAMES[@]}" | rofi -dmenu -i -p "$1" -no-custom
+}
+
+details_view() { # name
+    local n="$1" json last_json mesg rows choice dirv path
+    last_json="$STATE_DIR/$n.last.json"
+    json="$STATE_DIR/$n.last-change.json"
+    [ -f "$json" ] || json="$last_json"
+    if [ ! -f "$last_json" ]; then
+        rofi -dmenu -p "$n" -mesg "No recorded runs yet for $n (evidence is recorded from the next sync on)." </dev/null >/dev/null
+        return
+    fi
+    mesg=$(jq -r --arg n "$n" '
+        def t: strflocaltime("%a %d %b %H:%M:%S");
+        def dur: if . >= 60 then "\(. / 60 | floor)m\(. % 60 | tostring | if length < 2 then "0" + . else . end)s" else "\(.)s" end;
+        "<b>\($n)</b> · last run \(.started | t) · \(.result) (exit \(.exit)) · \(.duration | dur)"
+        + (if .no_changes then " · no changes" else "" end)' "$last_json")
+    if [ "$json" != "$last_json" ] && ! cmp -s "$json" "$last_json"; then
+        mesg="$mesg"$'\n'"Last run with changes: $(jq -r 'def t: strflocaltime("%a %d %b %H:%M:%S"); .started | t' "$json")"
+    fi
+    mesg="$mesg"$'\n'$(jq -r '.counts as $c |
+        "Downloaded ↓\($c.down) · Uploaded ↑\($c.up) · Deleted locally \($c.deleted_local) · Deleted on Drive \($c.deleted_drive) · Conflicts \($c.conflicts) · Renamed \($c.renamed) · \(.bytes) transferred"
+        + "\nDrive side: \(.path1 // "no changes") · Local side: \(.path2 // "no changes")"
+        + "\nConfirmed by rclone: \($c.copied) copied, \($c.deleted) deleted"' "$json" | esc)
+    rows=$(jq -r --argjson k "$DETAIL_ROWS" '.changes[:$k][] |
+        (if .dir == "down" then "↓ Drive → local  "
+         elif .dir == "up" then "↑ local → Drive  "
+         elif .dir == "del-local" then "✗ deleted locally  "
+         elif .dir == "del-drive" then "✗ deleted on Drive  "
+         else "⚠ conflict  " end) + .path' "$json")
+    [ -n "$rows" ] || rows="(no changed paths in this run)"
+    choice=$(printf '%s\n' "󰋚  Recent runs (last 30)" "󰈙  Open this remote's last run log" "$rows" \
+        | rofi -dmenu -i -no-custom -p "$n" -mesg "$mesg" -theme-str 'window {width: 50%;}') || return 0
+    case "$choice" in
+        "󰋚  Recent runs"*) recent_runs "$n" ;;
+        "󰈙  Open"*) term less +G "$STATE_DIR/$n.last.log" ;;
+        "(no changed"*) ;;
+        *)
+            path="${choice#*  }"
+            dirv="${RDIR[$n]}/$(dirname "$path")"
+            [ -d "$dirv" ] && setsid -f thunar "$dirv" >/dev/null 2>&1 ;;
+    esac
+}
+
+recent_runs() { # name
+    local n="$1" rows
+    rows=$(fd -t f -g "*-$n.json" "$RUNS_DIR" 2>/dev/null | sort -r | head -n 30 | while IFS= read -r f; do
+        jq -r 'def dur: if . >= 60 then "\(. / 60 | floor)m\(. % 60)s" else "\(.)s" end;
+            .counts as $c | "\(.started | strflocaltime("%d %b %H:%M"))  \(.result)  \(.duration | dur)  "
+            + (if ($c.down+$c.up+$c.deleted_local+$c.deleted_drive+$c.conflicts)==0 then "no changes"
+               else "↓\($c.down) ↑\($c.up) del \($c.deleted_local+$c.deleted_drive) conflicts \($c.conflicts) · \(.bytes)" end)' "$f"
+    done)
+    [ -n "$rows" ] || rows="(no runs recorded yet)"
+    printf '%s\n' "$rows" | rofi -dmenu -i -no-custom -p "$n runs" -mesg "Newest first (kept: 30 per remote)" >/dev/null
 }
 
 click_menu() {
-    local choice remote confirm
+    if pgrep -x rofi >/dev/null 2>&1; then pkill -x rofi; return 0; fi
+    local choice remote confirm n rows="" mesg
     local sync_now="󰑐  Sync now"
+    local check="󰍉  Check for pending changes (read-only Drive listing, 10 s - 2 min)"
+    local verify="󰄬  Verify now (bisync dry-run, changes nothing)"
+    local details="󰋽  Last sync details…"
     local open_folder="󰉋  Open Drive folder"
-    local open_log="󰈙  Open log"
-    local dry_run="󰜎  Dry-run (preview changes)"
+    local open_log="󰈙  Open full log"
     local resync="󰁯  Resync a remote…"
-    choice=$(printf '%s\n' "$sync_now" "$open_folder" "$open_log" "$dry_run" "$resync" \
-        | rofi -dmenu -i -p "Drive" -mesg "$(print_long | sd '&' '&amp;' | sd '<' '&lt;')" -no-custom) || exit 0
+    for n in "${NAMES[@]}"; do rows="$rows$(remote_line "$n" 1)"$'\n'; done
+    mesg=$(header_mesg)
+    choice=$(printf '%s%s\n' "$rows" "$(printf '%s\n' "$sync_now" "$check" "$verify" "$details" "$open_folder" "$open_log" "$resync" | esc)" \
+        | rofi -dmenu -i -p "Drive" -markup-rows -mesg "$mesg" -no-custom -format 's' \
+            -theme-str 'window {width: 50%;}') || exit 0
+    # Strip markup from remote rows to find the remote name.
+    local plain
+    plain=$(printf '%s' "$choice" | sed -e 's/<[^>]*>//g' -e 's/&amp;/\&/g')
+    for n in "${NAMES[@]}"; do
+        case "$plain" in *" $n  "*) details_view "$n"; return 0 ;; esac
+    done
 
-    case "$choice" in
-        "$sync_now")
-            systemctl --user start --no-block drive-sync.service
-            notify-send -a "Drive sync" -i folder-cloud "Drive sync" "Sync started" ;;
+    case "$plain" in
+        "$sync_now") start_sync ;;
+        "$check") check_pending_all ;;
+        "$verify") start_verify ;;
+        "$details")
+            remote=$(pick_remote "Details for") || exit 0
+            details_view "$remote" ;;
         "$open_folder")
             setsid -f thunar "$DRIVE_DIR" >/dev/null 2>&1 ;;
         "$open_log")
             term less +G "$LOGFILE" ;;
-        "$dry_run")
-            # shellcheck disable=SC2016 # $HOME expands inside the child bash
-            term bash -c '"$HOME"/.local/bin/drive-sync --dry-run; echo; read -rp "Press Enter to close" _' ;;
         "$resync")
-            remote=$(printf '%s\n' "${NAMES[@]}" | rofi -dmenu -i -p "Resync which remote" -no-custom) || exit 0
+            remote=$(pick_remote "Resync which remote") || exit 0
             confirm=$(printf '%s\n' "No" "Yes, resync $remote" | rofi -dmenu -i -no-custom \
                 -p "Confirm" -mesg "Resync rebuilds the baseline: union copy, newer file wins, nothing is deleted (deleted files may come back).") || exit 0
             [ "$confirm" = "Yes, resync $remote" ] || exit 0
@@ -157,10 +557,26 @@ click_menu() {
     esac
 }
 
+known() { local n; for n in "${NAMES[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
+
 case "${1:-}" in
     "") print_status 0 ;;
+    --tail) tail_loop ;;
     --plain) print_status 1 ;;
     --long) print_long ;;
     --click) click_menu ;;
-    *) echo "Usage: drive-sync-status [--plain|--long|--click]" >&2; exit 2 ;;
+    --pending)
+        known "${2:-}" || { echo "Usage: drive-sync-status --pending NAME" >&2; exit 2; }
+        rm -f "$RUN_DIR/$2.local"; local_pending "$2" | cut -d' ' -f1-3 ;;
+    --check-remote)
+        if [ -n "${2:-}" ]; then
+            known "$2" || { echo "unknown remote: $2" >&2; exit 2; }
+            check_remote "$2"
+        else
+            for n in "${NAMES[@]}"; do printf '%s ' "$n"; check_remote "$n" || echo "failed"; done
+        fi ;;
+    --details)
+        known "${2:-}" || { echo "Usage: drive-sync-status --details NAME" >&2; exit 2; }
+        details_view "$2" ;;
+    *) sed -n '2,31p' "$0" >&2; exit 2 ;;
 esac

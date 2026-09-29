@@ -8,7 +8,7 @@
 #
 # Usage:
 #   drive-sync [TARGET]            normal bisync (TARGET: all or a name from remotes.conf)
-#   drive-sync --dry-run [TARGET]  show what would change, touch nothing
+#   drive-sync --dry-run [TARGET]  show what would change, touch nothing ("Verify now")
 #   drive-sync --force [TARGET]    bypass the --max-delete safety abort (after checking!)
 #   drive-sync --resync [TARGET]   rebuild bisync baseline (union copy, newer wins, no deletes)
 #
@@ -20,6 +20,12 @@
 #     (drive-sync-status --click) or `drive-sync --resync <target>` to recover.
 #   - Per-remote status in ~/.local/state/drive-sync/<name>.status (read by drive-sync-status).
 #   - Full verbose log of the last run per remote: ~/.local/state/drive-sync/<name>.last.log
+#     (dry-runs: <name>.dryrun.log, result in <name>.verify).
+#   - Per-run evidence (counts + changed paths) as JSON: ~/.local/state/drive-sync/runs/
+#     (newest 30 per remote; <name>.last.json = latest, <name>.last-change.json = latest with changes).
+#   - Live progress while running: $XDG_RUNTIME_DIR/drive-sync/progress (key=value).
+#   - When $XDG_RUNTIME_DIR/drive-sync/notify-when-done exists (created by "Sync now"),
+#     a summary notification is shown at the end of the run.
 #   - Summary log: ~/.local/share/rclone/bisync.log (rotated at 2 MiB, one gzip generation).
 #   - Files overwritten/deleted locally by a sync are kept 14 days in
 #     ~/.local/share/drive-sync/backup/<name>/<date>/ (remote side uses Drive's trash).
@@ -29,12 +35,17 @@ export LC_ALL=C.UTF-8
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus}"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/drive-sync"
+RUNS_DIR="$STATE_DIR/runs"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/drive-sync"
+PROGRESS="$RUN_DIR/progress"
+NOTIFY_FLAG="$RUN_DIR/notify-when-done"
 LOGFILE="$HOME/.local/share/rclone/bisync.log"
 FILTERS="$HOME/.config/rclone/bisync-filters.txt"
 BACKUP_ROOT="$HOME/.local/share/drive-sync/backup"
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/drive-sync-${UID}.lock"
 LOG_MAX_BYTES=$((2 * 1024 * 1024))
 BACKUP_KEEP_DAYS=14
+RUNS_KEEP=30
 RENOTIFY_SECONDS=$((6 * 3600))
 MIN_BATTERY="${DRIVE_SYNC_MIN_BATTERY:-10}"
 
@@ -72,7 +83,7 @@ while [ $# -gt 0 ]; do
         --dry-run) MODE=dry-run ;;
         --force) MODE=force ;;
         --resync) MODE=resync ;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
         all) TARGET=all ;;
         -*) echo "Usage: drive-sync [--dry-run|--force|--resync] [all|NAME]" >&2; exit 2 ;;
         *)
@@ -82,7 +93,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-mkdir -p "$STATE_DIR" "$(dirname "$LOGFILE")" "$BACKUP_ROOT"
+mkdir -p "$STATE_DIR" "$RUNS_DIR" "$RUN_DIR" "$(dirname "$LOGFILE")" "$BACKUP_ROOT"
 
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -100,12 +111,20 @@ notify() { # urgency title body
     notify-send -a "Drive sync" -u "$1" -i folder-cloud "$2" "$3" 2>/dev/null || true
 }
 
+# Wake the polybar tail (drive-sync-status --tail) so it redraws right away.
+refresh_bar() { pkill -USR1 -f '^[^ ]*bash [^ ]*/drive-sync-status --tail$' 2>/dev/null || true; }
+
 rotate_log() {
     local size
     size=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)
     if [ "$size" -gt "$LOG_MAX_BYTES" ]; then
         gzip -c "$LOGFILE" >"$LOGFILE.1.gz" && : >"$LOGFILE"
     fi
+}
+
+fmt_duration() { # seconds -> "1m04s" / "12s"
+    local s="${1:-0}"
+    if [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s / 60)) $((s % 60)); else printf '%ds' "$s"; fi
 }
 
 # Read one key from a status file (key=value lines).
@@ -132,6 +151,13 @@ write_status() { # name state message [last_ok]
         echo "notified_state=${notified_state}"
         echo "notified_at=${notified_at:-0}"
     } >"$file.tmp" && mv -f "$file.tmp" "$file"
+}
+
+# Remote-side pending changes (Drive -> local) with the time they were measured.
+write_remote_pending() { # name new modified deleted source
+    local file="$STATE_DIR/$1.remote"
+    printf 'checked_at=%s\nnew=%s\nmodified=%s\ndeleted=%s\nsource=%s\n' \
+        "$(date +%s)" "$2" "$3" "$4" "$5" >"$file.tmp" && mv -f "$file.tmp" "$file"
 }
 
 # Notify only on state transitions, or again after RENOTIFY_SECONDS.
@@ -180,15 +206,143 @@ list_conflicts() { # local_dir
     fd -H -t f --no-ignore 'conflict[0-9]+' "$1" 2>/dev/null | sort
 }
 
-sync_remote() { # name remote local_dir
-    local name="$1" remote="$2" local_dir="$3"
-    local runlog="$STATE_DIR/$name.last.log" backup_dir rc before after new_conflicts
+# --- live progress ---------------------------------------------------------------
+# Phase from bisync INFO lines, bytes/percent/ETA from the one-line NOTICE stats
+# (--stats 1s --stats-one-line), file counts from queued vs copied lines.
+# shellcheck disable=SC2016 # awk program, not shell
+PROGRESS_AWK='
+/Building Path1 and Path2 listings/ { ph = "listing" }
+/Path[12] checking for diffs/       { ph = "comparing" }
+/Applying changes/                  { ph = "applying" }
+/Do queued copies to/               { ph = "copying" }
+/Updating listings/                 { ph = "finishing" }
+/Queue copy to Path[12] /           { q++ }
+/INFO  : .*: Copied \(/             { c++ }
+/NOTICE: +[0-9.]+ ?[KMGTPE]?i?B \/ / {
+    if (match($0, /NOTICE: +([0-9.]+ ?[KMGTPE]?i?B) \/ ([0-9.]+ ?[KMGTPE]?i?B), ([0-9]+%|-), ([^,]*), ETA (.*)$/, m)) {
+        bd = m[1]; bt = m[2]; pct = m[3]; sp = m[4]; eta = m[5]; sub(/ *\(xfr#.*$/, "", eta)
+    }
+}
+END {
+    sub(/%$/, "", pct); if (pct == "-") pct = ""
+    if (bt ~ /^0 ?B$/) pct = ""
+    printf "%s|%s|%s|%s|%s|%s|%d|%d\n", ph, pct, bd, bt, sp, eta, q, c
+}'
+
+write_progress() { # name index total runlog started
+    local phase pct bdone btotal speed eta queued copied
+    IFS='|' read -r phase pct bdone btotal speed eta queued copied \
+        < <(awk "$PROGRESS_AWK" "$4" 2>/dev/null)
+    {
+        printf 'remote=%s\nindex=%s\ntotal=%s\nmode=%s\n' "$1" "$2" "$3" "$MODE"
+        printf 'phase=%s\npercent=%s\nbytes_done=%s\nbytes_total=%s\n' "${phase:-starting}" "$pct" "$bdone" "$btotal"
+        printf 'speed=%s\neta=%s\nfiles_total=%s\nfiles_done=%s\n' "$speed" "$eta" "${queued:-0}" "${copied:-0}"
+        printf 'started=%s\nupdated=%s\n' "$5" "$(date +%s)"
+    } >"$PROGRESS.tmp" && mv -f "$PROGRESS.tmp" "$PROGRESS"
+}
+
+# --- per-run evidence --------------------------------------------------------------
+# Emits "kind<TAB>value" records from a bisync log:
+#   down/up (copies Drive->local / local->Drive), del-local/del-drive, conflict,
+#   renamed, copied, deleted (confirmations), bytes, p1/p2 (change summaries), nochange.
+# shellcheck disable=SC2016 # awk program, not shell
+SUMMARY_AWK='
+function rel(p) {
+    if (index(p, ld) == 1) p = substr(p, length(ld) + 1)
+    else if (index(p, rm) == 1) { p = substr(p, length(rm) + 1); sub(/^\//, "", p) }
+    return p
+}
+/- Path1 +Queue copy to Path2 +- /  { p = $0; sub(/.*Queue copy to Path2 +- /, "", p); print "down\t" rel(p); next }
+/- Path2 +Queue copy to Path1 +- /  { p = $0; sub(/.*Queue copy to Path1 +- /, "", p); print "up\t" rel(p); next }
+/- Path2 +Queue delete +- /         { p = $0; sub(/.*Queue delete +- /, "", p); print "del-local\t" rel(p); next }
+/- Path1 +Queue delete +- /         { p = $0; sub(/.*Queue delete +- /, "", p); print "del-drive\t" rel(p); next }
+/New or changed in both paths/      { p = $0; sub(/.*New or changed in both paths +- /, "", p); print "conflict\t" rel(p); next }
+/renamed to/                        { print "renamed\t1"; next }
+/INFO  : .*: Copied \(/             { print "copied\t1"; next }
+/INFO  : .*: Deleted$/              { print "deleted\t1"; next }
+/No changes found/                  { print "nochange\t1"; next }
+/Path1: +[0-9]+ changes:/           { s = $0; sub(/.*Path1: +/, "", s); gsub(/  +/, " ", s); print "p1\t" s; next }
+/Path2: +[0-9]+ changes:/           { s = $0; sub(/.*Path2: +/, "", s); gsub(/  +/, " ", s); print "p2\t" s; next }
+/NOTICE: +[0-9.]+ ?[KMGTPE]?i?B \/ / { s = $0; sub(/.*NOTICE: +/, "", s); sub(/ \/.*/, "", s); bytes = s; next }
+/^Transferred: +[0-9.]+ ?[KMGTPE]?i?B \/ / { s = $0; sub(/^Transferred: +/, "", s); sub(/ \/.*/, "", s); bytes = s; next }
+END { if (bytes != "") print "bytes\t" bytes }'
+
+# Writes runs/<ts>-<name>.json (+ <name>.last.json / .last-change.json); prints a
+# one-line human summary ("↓3 ↑1 ✗0 · 12 MiB") on stdout.
+record_run() { # name remote local_dir runlog rc state started ended
+    local name="$1" remote="$2" local_dir="$3" runlog="$4" rc="$5" state="$6" started="$7" ended="$8"
+    local json file
+    json=$(awk -v ld="${local_dir%/}/" -v rm="$remote" "$SUMMARY_AWK" "$runlog" 2>/dev/null \
+        | jq -R -s -c \
+            --arg name "$name" --arg mode "$MODE" --arg state "$state" \
+            --argjson rc "$rc" --argjson started "$started" --argjson ended "$ended" '
+            [split("\n")[] | select(length > 0) | split("\t") | {k: .[0], v: (.[1:] | join("\t"))}] as $r
+            | def list($k): [$r[] | select(.k == $k) | .v];
+              def n($k): (list($k) | length);
+            {
+              name: $name, mode: $mode, result: $state, exit: $rc,
+              started: $started, ended: $ended, duration: ($ended - $started),
+              counts: {
+                down: n("down"), up: n("up"), deleted_local: n("del-local"),
+                deleted_drive: n("del-drive"), conflicts: n("conflict"), renamed: n("renamed"),
+                copied: n("copied"), deleted: n("deleted")
+              },
+              bytes: ((list("bytes") | last) // "0 B"),
+              path1: ((list("p1") | last) // null),
+              path2: ((list("p2") | last) // null),
+              no_changes: (n("nochange") > 0),
+              changes: ([ $r[] | select(.k | IN("down", "up", "del-local", "del-drive", "conflict"))
+                          | {dir: .k, path: .v} ] | .[:200])
+            }') || return 0
+    [ -n "$json" ] || return 0
+    file="$RUNS_DIR/$(date -d "@$started" +%Y%m%d-%H%M%S)-$name.json"
+    printf '%s\n' "$json" >"$file"
+    cp -f "$file" "$STATE_DIR/$name.last.json"
+    if [ "$(jq '.counts.down + .counts.up + .counts.deleted_local + .counts.deleted_drive + .counts.conflicts' <<<"$json")" -gt 0 ]; then
+        cp -f "$file" "$STATE_DIR/$name.last-change.json"
+    fi
+    # Retention: newest RUNS_KEEP runs per remote.
+    fd -t f -g "*-$name.json" "$RUNS_DIR" 2>/dev/null | sort -r | tail -n +$((RUNS_KEEP + 1)) \
+        | while IFS= read -r old; do rm -f -- "$old"; done
+    jq -r '.counts as $c
+        | (if ($c.down + $c.up + $c.deleted_local + $c.deleted_drive + $c.conflicts) == 0 then "no changes"
+           else "↓\($c.down) ↑\($c.up) del \($c.deleted_local + $c.deleted_drive)"
+                + (if $c.conflicts > 0 then " conflicts \($c.conflicts)" else "" end)
+                + " · \(.bytes)" end)' <<<"$json"
+}
+
+# Parse "Path1: 3 changes: 3 new, 0 modified, 0 deleted" into "new mod del".
+change_counts() { # "summary string"
+    local s="${1:-}" new=0 mod=0 del=0
+    [[ $s =~ ([0-9]+)\ new ]] && new=${BASH_REMATCH[1]}
+    [[ $s =~ ([0-9]+)\ modified ]] && mod=${BASH_REMATCH[1]}
+    [[ $s =~ ([0-9]+)\ deleted ]] && del=${BASH_REMATCH[1]}
+    echo "$new $mod $del"
+}
+
+RCLONE_PID=""
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+cleanup() {
+    [ -n "$RCLONE_PID" ] && kill "$RCLONE_PID" 2>/dev/null
+    rm -f "$PROGRESS" "$PROGRESS.tmp"
+    refresh_bar
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT HUP
+
+SUMMARY=()   # per-remote lines for the "Sync now" notification
+
+sync_remote() { # name remote local_dir index total
+    local name="$1" remote="$2" local_dir="$3" index="$4" total="$5"
+    local runlog="$STATE_DIR/$name.last.log" backup_dir rc before after new_conflicts started ended human
     backup_dir="$BACKUP_ROOT/$name/$(date +%F)"
+    [ "$MODE" = dry-run ] && runlog="$STATE_DIR/$name.dryrun.log"
 
     if [ ! -d "$local_dir" ]; then
         write_status "$name" error "Local folder missing: $local_dir"
         notify_once "$name" error critical "Drive sync: $name" "Local folder missing: $local_dir"
         log "✗ $name: local folder missing ($local_dir)"
+        SUMMARY+=("✗ $name: local folder missing")
         return 1
     fi
 
@@ -205,6 +359,7 @@ sync_remote() { # name remote local_dir
         --retries 3 --retries-sleep 10s
         --low-level-retries 10
         --contimeout 30s --timeout 5m
+        --stats 1s --stats-one-line --stats-log-level NOTICE
         --color NEVER
         -v
     )
@@ -217,14 +372,50 @@ sync_remote() { # name remote local_dir
 
     log "Syncing $name ($MODE)..."
     before=$(list_conflicts "$local_dir")
-    rclone bisync "${args[@]}" >"$runlog" 2>&1
+    started=$(date +%s)
+    : >"$runlog"
+    write_progress "$name" "$index" "$total" "$runlog" "$started"
+    refresh_bar
+    rclone bisync "${args[@]}" >"$runlog" 2>&1 &
+    RCLONE_PID=$!
+    while kill -0 "$RCLONE_PID" 2>/dev/null; do
+        write_progress "$name" "$index" "$total" "$runlog" "$started"
+        sleep 1
+    done
+    wait "$RCLONE_PID"
     rc=$?
-    # Keep the summary block plus every error/notice in the long-lived log.
-    rg -N '(ERROR|NOTICE|Transferred:|Errors:|Checks:|Elapsed time:)' "$runlog" \
-        | rg -v 'shared Google Drive client_id' | tail -n 40 >>"$LOGFILE"
+    RCLONE_PID=""
+    ended=$(date +%s)
+    # Keep errors/notices in the long-lived log (not the per-second stats lines).
+    rg -N '(ERROR|NOTICE)' "$runlog" \
+        | rg -v 'shared Google Drive client_id|NOTICE: +[0-9.]+ ?[KMGTPE]?i?B / ' | tail -n 40 >>"$LOGFILE"
+    # rclone's shared OAuth client is rate limited and being retired: remember it for the menu.
+    if rg -q 'shared Google Drive client_id' "$runlog"; then
+        : >"$STATE_DIR/$name.shared-client-id"
+    else
+        rm -f "$STATE_DIR/$name.shared-client-id"
+    fi
 
     if [ "$MODE" = dry-run ]; then
-        log "dry-run $name finished (exit $rc); full output: $runlog"
+        local p1 p2 result
+        p1=$(rg -o 'Path1: +[0-9]+ changes:.*' "$runlog" | tail -n 1 | tr -s ' ')
+        p2=$(rg -o 'Path2: +[0-9]+ changes:.*' "$runlog" | tail -n 1 | tr -s ' ')
+        if [ "$rc" -ne 0 ]; then result=error
+        elif [ -z "$p1$p2" ]; then result=in-sync
+        else result=differs; fi
+        printf 'checked_at=%s\nresult=%s\nexit=%s\npath1=%s\npath2=%s\nduration=%s\n' \
+            "$ended" "$result" "$rc" "$p1" "$p2" "$((ended - started))" >"$STATE_DIR/$name.verify"
+        if [ "$rc" -eq 0 ]; then
+            # Path1 = Drive: exact remote-side pending counts.
+            # shellcheck disable=SC2046 # three numbers, split on purpose
+            write_remote_pending "$name" $(change_counts "$p1") verify
+        fi
+        case "$result" in
+            in-sync) SUMMARY+=("✓ $name: in sync") ;;
+            differs) SUMMARY+=("≠ $name: Drive ${p1:-no changes}; local ${p2:-no changes}") ;;
+            *) SUMMARY+=("✗ $name: dry-run failed (exit $rc)") ;;
+        esac
+        log "dry-run $name finished (exit $rc, $result); full output: $runlog"
         return "$rc"
     fi
 
@@ -233,12 +424,16 @@ sync_remote() { # name remote local_dir
         new_conflicts=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | rg -c . || true)
         write_status "$name" ok "Synced" "$(date +%s)"
         clear_notified "$name"
+        write_remote_pending "$name" 0 0 0 sync
+        rm -f "$RUN_DIR/$name.local"   # local pending cache
+        human=$(record_run "$name" "$remote" "$local_dir" "$runlog" "$rc" ok "$started" "$ended")
         if [ "${new_conflicts:-0}" -gt 0 ]; then
             notify normal "Drive sync: $name conflicts" \
                 "$new_conflicts file(s) changed on both sides. Newer kept; older renamed *.conflictN in $local_dir"
             log "⚠ $name: $new_conflicts new conflict file(s)"
         fi
-        log "✓ $name synced successfully"
+        log "✓ $name synced successfully in $(fmt_duration $((ended - started))): ${human:-no summary}"
+        SUMMARY+=("✓ $name: ${human:-synced} ($(fmt_duration $((ended - started))))")
         return 0
     fi
 
@@ -270,15 +465,28 @@ sync_remote() { # name remote local_dir
         [ -n "$msg" ] || msg="rclone exit $rc"
     fi
     write_status "$name" "$state" "$msg"
+    record_run "$name" "$remote" "$local_dir" "$runlog" "$rc" "$state" "$started" "$ended" >/dev/null
     case "$state" in
         offline|rate-limited|locked) ;; # transient: no popup
         *) notify_once "$name" "$state" "$urgency" "Drive sync failed: $name" "$msg" ;;
     esac
     log "✗ $name sync failed (exit $rc, $state): $msg"
+    SUMMARY+=("✗ $name: $state - $msg")
     case "$state" in
         offline|rate-limited|locked) return 0 ;; # transient: retried next run
     esac
     return "$rc"
+}
+
+# "Sync now" / "Verify now" asked for a summary notification when this run ends.
+notify_summary() { # exit_code elapsed
+    [ -e "$NOTIFY_FLAG" ] || return 0
+    rm -f "$NOTIFY_FLAG"
+    local title urgency=normal
+    if [ "$MODE" = dry-run ]; then title="Drive verify finished"
+    elif [ "$1" -eq 0 ]; then title="Drive sync finished"
+    else title="Drive sync failed"; urgency=critical; fi
+    notify "$urgency" "$title ($(fmt_duration "$2"))" "$(printf '%s\n' "${SUMMARY[@]}")"
 }
 
 rotate_log
@@ -288,6 +496,8 @@ fd -t d --min-depth 2 --max-depth 2 --changed-before "${BACKUP_KEEP_DAYS}d" . "$
 
 if [ "$MODE" = normal ] && [ -n "${DRIVE_SYNC_TIMER:-}" ] && battery_too_low; then
     log "Battery below ${MIN_BATTERY}% and discharging; skipping timer run"
+    SUMMARY+=("Skipped: battery below ${MIN_BATTERY}%")
+    notify_summary 0 0
     exit 0
 fi
 
@@ -298,14 +508,25 @@ if ! is_online; then
         [ "$TARGET" = all ] || [ "$TARGET" = "$name" ] || continue
         write_status "$name" offline "No network"
     done
+    SUMMARY+=("Skipped: offline (no route to Google APIs)")
+    notify_summary 0 0
     exit 0
 fi
 
-exit_code=0
+selected=()
 for entry in "${REMOTES[@]}"; do
-    IFS='|' read -r name remote local_dir <<<"$entry"
-    [ "$TARGET" = all ] || [ "$TARGET" = "$name" ] || continue
-    sync_remote "$name" "$remote" "$local_dir" || exit_code=1
+    [ "$TARGET" = all ] || [ "$TARGET" = "${entry%%|*}" ] || continue
+    selected+=("$entry")
 done
 
+exit_code=0
+run_start=$(date +%s)
+i=0
+for entry in "${selected[@]}"; do
+    i=$((i + 1))
+    IFS='|' read -r name remote local_dir <<<"$entry"
+    sync_remote "$name" "$remote" "$local_dir" "$i" "${#selected[@]}" || exit_code=1
+done
+
+notify_summary "$exit_code" $(( $(date +%s) - run_start ))
 exit "$exit_code"
