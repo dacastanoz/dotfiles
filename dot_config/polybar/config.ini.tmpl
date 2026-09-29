@@ -48,7 +48,7 @@ font-2 = "JetBrainsMono Nerd Font:style=Bold:size=9;2"
 modules-left = launcher i3 cpu temperature memory
 modules-center = date
 ; The system tray lives only on this (primary) bar: X11 allows a single tray.
-modules-right = updates drive-sync airplane pulseaudio{{ if .hasWifi }} network{{ end }}{{ if .hasBluetooth }} bluetooth{{ end }}{{ if .hasBattery }} battery battery-care{{ end }} shortcuts control power tray
+modules-right = bar-errors updates drive-sync airplane pulseaudio{{ if .hasWifi }} network{{ end }}{{ if .hasBluetooth }} bluetooth{{ end }}{{ if .hasBattery }} battery battery-care{{ end }} shortcuts control power tray
 
 enable-ipc = true
 cursor-click = pointer
@@ -57,7 +57,7 @@ cursor-scroll = ns-resize
 ; Bar for secondary monitors: identical but without the tray.
 [bar/example-secondary]
 inherit = bar/example
-modules-right = updates drive-sync airplane pulseaudio{{ if .hasWifi }} network{{ end }}{{ if .hasBluetooth }} bluetooth{{ end }}{{ if .hasBattery }} battery battery-care{{ end }} shortcuts control power
+modules-right = bar-errors updates drive-sync airplane pulseaudio{{ if .hasWifi }} network{{ end }}{{ if .hasBluetooth }} bluetooth{{ end }}{{ if .hasBattery }} battery battery-care{{ end }} shortcuts control power
 
 [settings]
 screenchange-reload = true
@@ -119,13 +119,17 @@ format-prefix-foreground = ${colors.frost}
 label = %percentage:2%%
 
 [module/temperature]
+; custom/script modules run through ~/.local/bin/bar-errors (stdout first line
+; only; failures print a short glyph and go to ~/.cache/bar-errors.log) and
+; carry label-maxlen as a last-resort cap (60 leaves room for %{F} color tags).
 ; CPU temperature (k10temp Tctl by hwmon name) + thermal-guard state (T19).
 ; Click: live monitor (btop popup); right-click: rofi summary of all sensors.
 type = custom/script
-exec = ~/.config/polybar/scripts/temperature.sh
+exec = ~/.local/bin/bar-errors run temperature ~/.config/polybar/scripts/temperature.sh
 interval = 3
 click-left = ~/.config/polybar/scripts/temperature.sh --monitor &
 click-right = ~/.config/polybar/scripts/temperature.sh --summary &
+label-maxlen = 60
 
 [module/memory]
 type = internal/memory
@@ -149,20 +153,33 @@ label-foreground = ${colors.fg-hi}
 
 ; ---------------------------------------------------------- right
 [module/updates]
+; Pending repo + AUR updates. The script only reads a shared cache
+; (~/.cache/bar-updates); one locked background worker refreshes it at most
+; every 30 min, so both bars show the same value and never run paru twice.
+; Left click: rofi menu (list, update, refresh, errors); right click: refresh.
 type = custom/script
-exec = ~/.config/polybar/scripts/arch_updates.sh
-; checkupdates/paru hit the network: poll every 30 min
-interval = 1800
-format-prefix = "󰏖 "
-format-prefix-foreground = ${colors.frost}
+exec = ~/.local/bin/bar-errors run updates ~/.config/polybar/scripts/arch_updates.sh
+interval = 30
 label = %output%
-click-left = ghostty -e paru &
+label-maxlen = 60
+click-left = ~/.config/polybar/scripts/arch_updates.sh --menu &
+click-right = ~/.config/polybar/scripts/arch_updates.sh --refresh-bg &
+
+; Bar script errors (~/.cache/bar-errors.log, last 24 h); hidden when none.
+[module/bar-errors]
+type = custom/script
+exec = ~/.local/bin/bar-errors
+interval = 30
+label = %output%
+label-maxlen = 40
+click-left = ~/.local/bin/bar-errors --menu &
 
 [module/airplane]
 type = custom/script
-exec = ~/.config/polybar/scripts/airplane.sh
+exec = ~/.local/bin/bar-errors run airplane ~/.config/polybar/scripts/airplane.sh
 interval = 3
 click-left = ~/.local/bin/control-center airplane &
+label-maxlen = 60
 
 ; Left click: mixer, right click: mute, middle click: output picker, scroll: volume
 [module/pulseaudio]
@@ -203,11 +220,12 @@ label-disconnected-foreground = ${colors.muted}
 ; Left click: Bluetooth manager, right click: power toggle
 [module/bluetooth]
 type = custom/script
-exec = ~/.config/polybar/scripts/bluetooth.sh
+exec = ~/.local/bin/bar-errors run bluetooth ~/.config/polybar/scripts/bluetooth.sh
 interval = 5
 click-left = blueman-manager &
 click-right = ~/.config/polybar/scripts/bluetooth.sh toggle
 click-middle = ~/.local/bin/control-center bluetooth &
+label-maxlen = 60
 
 [module/battery]
 type = internal/battery
@@ -245,10 +263,11 @@ ramp-capacity-foreground = ${colors.frost}
 ; (battery-status refresh, sent after profile / limit changes).
 [module/battery-care]
 type = custom/script
-exec = ~/.local/bin/battery-status polybar-tail
+exec = ~/.local/bin/bar-errors tail battery-care ~/.local/bin/battery-status polybar-tail
 tail = true
 click-left = ~/.local/bin/control-center battery &
 click-right = ~/.local/bin/battery-status cycle-profile &
+label-maxlen = 60
 
 [module/shortcuts]
 ; Shortcuts / help menu (rofi): every i3/ghostty/tmux/nvim key and useful commands.
@@ -284,6 +303,7 @@ tray-background = ${colors.bg}
 ; Google Drive sync status (rclone bisync); click for actions
 [module/drive-sync]
 type = custom/script
-exec = ~/.local/bin/drive-sync-status
+exec = ~/.local/bin/bar-errors run drive-sync ~/.local/bin/drive-sync-status
 interval = 15
 click-left = ~/.local/bin/drive-sync-status --click &
+label-maxlen = 60

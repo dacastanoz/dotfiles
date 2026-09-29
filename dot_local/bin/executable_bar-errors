@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Polybar safety net for custom/script modules + a tiny "bar errors" indicator.
+#
+#   bar-errors run <name> <cmd> [args]   run an interval module script: stdout
+#                                        passes through (first line only); on a
+#                                        non-zero exit prints a short fallback
+#                                        glyph and logs stderr
+#   bar-errors tail <name> <cmd> [args]  same for tail = true modules (streams
+#                                        stdout; stderr lines are logged)
+#   bar-errors                           indicator label (hidden when no errors
+#                                        in the last 24 h)
+#   bar-errors --menu                    rofi list of recent errors + Clear
+#   bar-errors --clear                   empty the log
+#
+# Log: ~/.cache/bar-errors.log, "<epoch><TAB><name>: <message>" per line.
+set -u
+export LC_TIME=C   # English dates in menus
+
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/bar-errors.log"
+WINDOW=86400      # indicator window (24 h)
+MAX_LINES=500     # lines kept in the log
+C_ERR="#bf616a" C_MUTED="#4c566a"
+ICON_ERR=$'\U000F0028'   # nf-md-alert_circle
+FALLBACK="%{F$C_MUTED}"$'\U000F0028'"%{F-}"
+
+log() { # log <name> <text>; one entry per non-empty line
+    local name="$1" line now
+    now=$(date +%s)
+    mkdir -p "${LOG%/*}"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        printf '%s\t%s: %s\n' "$now" "$name" "${line:0:300}" >>"$LOG"
+    done <<<"$2"
+    if [ "$(wc -l <"$LOG")" -gt "$MAX_LINES" ]; then
+        tail -n "$MAX_LINES" "$LOG" >"$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"
+    fi
+}
+
+cmd_run() { # cmd_run <name> <cmd...>
+    local name="$1" out err rc
+    shift
+    err=$(mktemp) || { echo "$FALLBACK"; return 0; }
+    out=$("$@" 2>"$err")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "$name" "$(head -n 5 "$err")"
+        [ -s "$err" ] || log "$name" "exit code $rc"
+        echo "$FALLBACK"
+    else
+        # Only the first line ever reaches the bar.
+        printf '%s\n' "${out%%$'\n'*}"
+    fi
+    rm -f "$err"
+}
+
+cmd_tail() { # cmd_tail <name> <cmd...>
+    local name="$1" rc
+    shift
+    # Tail scripts may be poked with signals matched by their command line
+    # (e.g. pkill -USR1 -f 'battery-status polybar-tail'), which also matches
+    # this wrapper: ignore them here (handlers, not SIG_IGN, so the child still
+    # gets default/own dispositions after exec).
+    trap : USR1 USR2
+    "$@" 2> >(trap : USR1 USR2; while IFS= read -r l; do log "$name" "$l"; done)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "$name" "exited with code $rc"
+        echo "$FALLBACK"
+        # Keep the fallback visible; polybar restarts the tail on reload.
+        sleep infinity
+    fi
+}
+
+recent() { # recent entries (last 24 h), newest first
+    [ -s "$LOG" ] || return 0
+    awk -F'\t' -v min="$(( $(date +%s) - WINDOW ))" '$1 >= min' "$LOG" | tac
+}
+
+cmd_status() {
+    local n
+    n=$(recent | wc -l)
+    if [ "$n" -gt 0 ]; then echo "%{F$C_ERR}$ICON_ERR%{F-} $n"; else echo ""; fi
+}
+
+cmd_menu() {
+    if pgrep -x rofi >/dev/null 2>&1; then pkill -x rofi; return 0; fi
+    local clear="󰃢  Clear" rows choice
+    rows=$(recent | while IFS=$'\t' read -r t msg; do
+        printf '%s  %s\n' "$(date -d "@$t" '+%d %b %H:%M')" "$msg"
+    done | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+    [ -n "$rows" ] || rows="No bar errors in the last 24 h"
+    choice=$(printf '%s\n%s\n' "$clear" "$rows" \
+        | rofi -dmenu -i -no-custom -markup-rows -p "Bar errors") || return 0
+    [ "$choice" = "$clear" ] && : >"$LOG"
+}
+
+case "${1:-}" in
+    run)  shift; [ $# -ge 2 ] || exit 2; cmd_run "$@" ;;
+    tail) shift; [ $# -ge 2 ] || exit 2; cmd_tail "$@" ;;
+    "")   cmd_status ;;
+    --menu) cmd_menu ;;
+    --clear) : >"$LOG" ;;
+    *) echo "Usage: bar-errors [run|tail <name> <cmd...>|--menu|--clear]" >&2; exit 2 ;;
+esac
