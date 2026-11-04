@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Polybar safety net for custom/script modules + a tiny "bar errors" indicator.
+# Status bar safety net for custom/script modules + a tiny "bar errors" indicator.
 #
 #   bar-errors run <name> <cmd> [args]   run an interval module script: stdout
 #                                        passes through (first line only); on a
@@ -68,7 +68,7 @@ cmd_tail() { # cmd_tail <name> <cmd...>
     if [ "$rc" -ne 0 ]; then
         log "$name" "exited with code $rc"
         echo "$FALLBACK"
-        # Keep the fallback visible; polybar restarts the tail on reload.
+        # Keep the fallback visible; the bar restarts the tail on reload.
         sleep infinity
     fi
 }

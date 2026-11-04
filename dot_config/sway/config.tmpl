@@ -5,8 +5,7 @@ set $mod Mod4
 font pango:Hack 9
 floating_modifier $mod normal
 
-# Applied to everything Sway starts, so these reach only this session. i3 is not
-# affected. session-env does the same for D-Bus and systemd activated services.
+# Applied to everything Sway starts, so these reach only this session. session-env does the same for D-Bus and systemd activated services.
 set $env env ELECTRON_OZONE_PLATFORM_HINT=auto MOZ_ENABLE_WAYLAND=1 XDG_CURRENT_DESKTOP=sway
 set $scripts ~/.config/sway/scripts
 
@@ -192,7 +191,6 @@ for_window [class="mpv"] floating enable
 for_window [app_id="mpv"] floating enable
 for_window [class="imv"] floating enable
 for_window [app_id="imv"] floating enable
-for_window [class="feh" title="^Wi-Fi QR code$"] floating enable, move position center
 for_window [class="(?i)^zenity$"] floating enable
 for_window [app_id="(?i)zenity$"] floating enable
 for_window [class="cachyos-welcome"] floating enable
@@ -371,7 +369,7 @@ bindsym $mod+Shift+j exec $env $scripts/bg-apps --menu
 
 # Export the session environment to D-Bus/systemd user services FIRST, before
 # anything that may D-Bus-activate a service. It stays running to undo this when
-# Sway exits: the user manager lingers, so these values would otherwise reach i3.
+# Sway exits: the user manager lingers, so these values would otherwise outlive the session.
 exec $env $scripts/session-env
 
 exec $env swaymsg 'workspace number 1; exec $env ghostty'

@@ -245,7 +245,7 @@ notify() { # urgency title body
     command -v notify-send >/dev/null 2>&1 || return 0
     # Linger is on, so the timer can fire before anyone logs in to X: do not
     # D-Bus-activate dunst without a display (it would fail and show as a failed unit).
-    pgrep -u "$(id -u)" -x dunst >/dev/null || pgrep -u "$(id -u)" -x sway >/dev/null || pgrep -u "$(id -u)" -x i3 >/dev/null || return 0
+    pgrep -u "$(id -u)" -x dunst >/dev/null || pgrep -u "$(id -u)" -x sway >/dev/null || return 0
     notify-send -a "Drive sync" -u "$1" -i folder-cloud "$2" "$3" 2>/dev/null || true
 }
 

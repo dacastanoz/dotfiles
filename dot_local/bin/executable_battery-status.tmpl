@@ -4,9 +4,9 @@
 # Usage:
 #   battery-status info                  key=value summary (capacity, W, times, health...)
 #   battery-status health-mesg           Pango health section for the rofi battery menu
-#   battery-status polybar-tail          polybar tail module: charge-limit / profile glyphs
+#   battery-status polybar-tail          bar tail module (name kept, Waybar calls it): charge-limit / profile glyphs
 #                                        (refreshes every 15 s or on SIGUSR1)
-#   battery-status refresh               make the polybar module redraw now
+#   battery-status refresh               make the bar module redraw now
 #   battery-status cycle-profile         power-saver -> balanced -> performance -> ...
 #   battery-status set-profile <name>    powerprofilesctl set <name> (+ bar refresh)
 #   battery-status toggle-limit          toggle the 80 % limit (pkexec battery-care)
@@ -384,7 +384,7 @@ cmd_alert() {
     echo "$level" >"$ALERT_STATE"
     if (( dry )); then echo "capacity=$cap: ALERT level $level"; return 0; fi
     # Only when a desktop session is up (the timer also runs before login with linger).
-    pgrep -u "$UID" -x dunst >/dev/null || pgrep -u "$UID" -x sway >/dev/null || pgrep -u "$UID" -x i3 >/dev/null || return 0
+    pgrep -u "$UID" -x dunst >/dev/null || pgrep -u "$UID" -x sway >/dev/null || return 0
     case $level in
         20) notify normal battery-low "Battery low: $cap %" "Plug in the charger soon." ;;
         10) notify critical battery-caution "Battery critical: $cap %" "Plug in the charger now." ;;

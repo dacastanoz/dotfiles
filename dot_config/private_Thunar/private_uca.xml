@@ -43,7 +43,7 @@
 	<name>Copy Path</name>
 	<submenu></submenu>
 	<unique-id>1779285020791297-4</unique-id>
-	<command>sh -c 'if [ -n "$WAYLAND_DISPLAY" ]; then printf %s "$1" | wl-copy; else printf %s "$1" | xclip -selection clipboard; fi &amp;&amp; notify-send -i edit-copy "Path copied" "$1"' _ %f</command>
+	<command>sh -c 'printf %s "$1" | wl-copy &amp;&amp; notify-send -i edit-copy "Path copied" "$1"' _ %f</command>
 	<description>Copy the full path to the clipboard</description>
 	<range></range>
 	<patterns>*</patterns>

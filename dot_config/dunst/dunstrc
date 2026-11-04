@@ -1,11 +1,11 @@
 # Dunst - Nord theme (dunst >= 1.9 syntax). Backup: dunstrc.bak-20260928
-# Control with dunstctl (bound in i3): close, close-all, history-pop.
+# Control with dunstctl (bound in Sway): close, close-all, history-pop.
 
 [global]
     monitor = 0
     follow = keyboard
 
-    # Geometry: top-right, below polybar
+    # Geometry: top-right, below the bar
     width = (240, 360)
     height = (0, 180)
     origin = top-right

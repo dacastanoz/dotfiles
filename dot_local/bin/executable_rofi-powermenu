@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Power menu: lock, logout (Sway or i3), suspend, reboot, shutdown.
+# Power menu: lock, logout, suspend, reboot, shutdown.
 # Dangerous actions ask for confirmation.
 set -u
 
@@ -13,13 +13,7 @@ confirm() {
     [ "$answer" = "Yes" ]
 }
 
-lock() {
-    if [ -n "${SWAYSOCK:-}" ]; then "$HOME/.config/sway/scripts/lock"; else i3lock --blur 5; fi
-}
-
-logout_wm() {
-    if [ -n "${SWAYSOCK:-}" ]; then swaymsg exit; else i3-msg exit; fi
-}
+lock() { "$HOME/.config/sway/scripts/lock"; }
 
 # Suspend is offered only while logind allows it. Masking the sleep targets turns it
 # off, and `systemctl suspend` would then fail after the screen is already locked.
@@ -36,7 +30,7 @@ choice=$({
 
 case "$choice" in
     Lock)     sleep 0.2; lock ;;
-    Logout)   confirm "Log out" && logout_wm ;;
+    Logout)   confirm "Log out" && swaymsg exit ;;
     Suspend)  confirm "Suspend" && { sleep 0.2; lock & systemctl suspend; } ;;
     Reboot)   confirm "Reboot" && systemctl reboot ;;
     Shutdown) confirm "Shut down" && systemctl poweroff ;;

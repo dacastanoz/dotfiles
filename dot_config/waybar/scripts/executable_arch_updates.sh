@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Polybar "updates" module: pending repo + AUR updates.
+# Bar "updates" module: pending repo + AUR updates.
 #
 # One shared worker computes the results; every bar only READS the cache, so
 # two bars (eDP + HDMI) never run two `paru -Qua` at once (concurrent paru

@@ -4,14 +4,14 @@
 #
 # Usage:
 #   shortcuts-menu              open the menu (categories first, Esc goes back)
-#   shortcuts-menu --category C open category C directly (all, i3-apps, nvim, tmux, ...)
+#   shortcuts-menu --category C open category C directly (all, sway-apps, nvim, tmux, ...)
 #   shortcuts-menu --list       print all rows as TSV: category, section, key, description, kind, action
 #   shortcuts-menu --counts     rows per category
 #   shortcuts-menu --rebuild    rebuild the cache and print the row count
 #   shortcuts-menu --run CAT N  run row N (0-based) of category CAT without rofi (testing)
 #
 # Everything is generated or data-driven, so the menu follows the configs:
-#   i3        ~/.config/i3/config: every bindsym. Label = "# desc: ..." comment right above
+#   sway      ~/.config/sway/config: every bindsym and bindgesture. Label = "# desc: ..." comment right above
 #             the binding, else a built-in label. Resize-mode keys are listed separately.
 #   ghostty   `ghostty +list-keybinds` (defaults + user config, the effective set)
 #   tmux      ~/.tmux.conf bind lines + prefix; tmux defaults/plugins from tmux.tsv
@@ -23,36 +23,27 @@
 # Results are cached in ~/.cache/shortcuts-menu and rebuilt when any source changes.
 #
 # Row kinds:
-#   i3      run the binding's exact i3 command with i3-msg (same behaviour as the key)
+#   sway    run the binding's exact command with swaymsg (same behaviour as the key)
 #   term    run the command in a floating ghostty popup (class dev.gentleman.popup)
-#   launch  start a program (i3 exec, detached)
+#   launch  start a program (sway exec, detached)
 #   copy    information only; Enter copies the key/command to the clipboard
 set -u
 
 DATA_DIR=${SHORTCUTS_DATA_DIR:-$HOME/.config/shortcuts-menu}
-# The window manager in use: its config, command tool and name in the menu.
-if [ -n "${SWAYSOCK:-}" ]; then
-    I3_CONFIG=${SHORTCUTS_I3_CONFIG:-$HOME/.config/sway/config}
-    WM_MSG=swaymsg
-    WM_NAME=sway
-else
-    I3_CONFIG=${SHORTCUTS_I3_CONFIG:-$HOME/.config/i3/config}
-    WM_MSG=i3-msg
-    WM_NAME=i3
-fi
+SWAY_CONFIG=${SHORTCUTS_SWAY_CONFIG:-$HOME/.config/sway/config}
 TMUX_CONF=${SHORTCUTS_TMUX_CONF:-$HOME/.tmux.conf}
 GHOSTTY_CONFIG=$HOME/.config/ghostty/config
 NVIM_LUA=$HOME/.config/nvim/lua
 YAZI_KEYMAP=$HOME/.config/yazi/keymap.toml
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/shortcuts-menu
-CACHE=$CACHE_DIR/rows-$WM_NAME.tsv
+CACHE=$CACHE_DIR/rows.tsv
 POPUP_CLASS=dev.gentleman.popup
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # Categories in display order: id|icon|color|title
 CATS=(
-    "i3-apps|"$'\U000F003B'"|#d08770|$WM_NAME · apps & launchers"
-    "i3-windows|"$'\U000F056E'"|#88c0d0|$WM_NAME · windows & workspaces"
+    "sway-apps|"$'\U000F003B'"|#d08770|sway · apps & launchers"
+    "sway-windows|"$'\U000F056E'"|#88c0d0|sway · windows & workspaces"
     "system|"$'\U000F0493'"|#81a1c1|System & connections"
     "media|"$'\U000F075A'"|#b48ead|Media & screenshots"
     "monitoring|"$'\U000F050F'"|#bf616a|Monitoring"
@@ -67,15 +58,15 @@ CATS=(
     "shell|"$'\U000F023A'"|#81a1c1|Shell: fish, zoxide, atuin, fzf"
 )
 ALL_ICON=$'\U000F0349'
-# Row kind glyphs: run (i3), term, launch, copy
+# Row kind glyphs: run (sway), term, launch, copy
 KIND_ICONS=$'\U000F040A'"|"$'\U000F018D'"|"$'\U000F03CC'"|"$'\U000F018F'
 
 cat_ids() { local c; for c in "${CATS[@]}"; do printf '%s\n' "${c%%|*}"; done; }
 
-# ============================================================ i3
-i3_rows() {
-    [ -r "$I3_CONFIG" ] || return 0
-    awk -v wm="$WM_NAME" '
+# ============================================================ sway
+sway_rows() {
+    [ -r "$SWAY_CONFIG" ] || return 0
+    awk -v wm="sway" '
     function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
 
     function pretty_part(p,   n) {
@@ -129,7 +120,7 @@ i3_rows() {
         if (c ~ /control-center radio-status/) return "Show airplane / radio status"
         if (c ~ /control-center/) return "Control center"
         if (c ~ /display-toggle/) return "Quick display cycle"
-        if (c ~ /i3lock|scripts\/lock/) return "Lock screen"
+        if (c ~ /scripts\/lock/) return "Lock screen"
         if (c ~ /thunar/) return "File manager (Thunar)"
         if (c ~ /blueman-manager/) return "Bluetooth manager"
         if (c ~ /gnome-calculator/) return "Calculator"
@@ -141,11 +132,11 @@ i3_rows() {
         if (c ~ /amixer .*toggle/) return "Mute / unmute"
         if (c ~ /brightnessctl set \+/) return "Brightness up"
         if (c ~ /brightnessctl set [0-9]+%-/) return "Brightness down"
-        if (c ~ /maim -s|grim -g/) return "Screenshot area to clipboard"
-        if (c ~ /maim |grim /) return "Screenshot full screen to file"
+        if (c ~ /grim -g/) return "Screenshot area to clipboard"
+        if (c ~ /grim /) return "Screenshot full screen to file"
         if (c ~ /dunstctl close-all/) return "Close all notifications"
         if (c ~ /dunstctl history-pop/) return "Show last notification again"
-        if (c ~ /setxkbmap|xkb_switch_layout/) return "Switch keyboard layout"
+        if (c ~ /xkb_switch_layout/) return "Switch keyboard layout"
         if (c ~ /tmux new-session -A -s main/) return "Terminal attached to tmux session main"
         if (c ~ /lazygit/) return "lazygit popup"
         if (c ~ /yazi/) return "yazi popup"
@@ -165,7 +156,6 @@ i3_rows() {
         if (c == "focus mode_toggle") return "Switch focus between tiling and floating windows"
         if (c == "focus parent") return "Focus parent container"
         if (c == "reload") return "Reload " wm " config"
-        if (c == "restart") return "Restart i3 in place (keeps windows)"
         if (c == "exit") return "Exit " wm " (log out)"
         if (c ~ /^mode "?resize"?$/) return "Resize mode (see the resize mode rows)"
         if (c ~ /^resize shrink width/) return "Shrink width"
@@ -177,14 +167,14 @@ i3_rows() {
     }
 
     function category(c, k) {
-        if (k ~ /XF86Audio|XF86MonBrightness|Print/ || c ~ /playerctl|pamixer|amixer|brightnessctl|maim|grim/)
+        if (k ~ /XF86Audio|XF86MonBrightness|Print/ || c ~ /playerctl|pamixer|amixer|brightnessctl|grim/)
             return "media"
         if (c ~ /lazygit|yazi|nvim-project|tmux/) return "dev"
         if (c ~ /temperature\.sh|btop/) return "monitoring"
-        if (c ~ /control-center|display-toggle|blueman|rofi-powermenu|i3lock|scripts\/lock|dunstctl|setxkbmap|xkb_switch_layout/)
+        if (c ~ /control-center|display-toggle|blueman|rofi-powermenu|scripts\/lock|dunstctl|xkb_switch_layout/)
             return "system"
-        if (c ~ /^exec /) return "i3-apps"
-        return "i3-windows"
+        if (c ~ /^exec /) return "sway-apps"
+        return "sway-windows"
     }
 
     function emit(cat, section, key, desc, kind, action) {
@@ -210,7 +200,7 @@ i3_rows() {
             while (rest ~ /^--/) sub(/^--[^ \t]+[ \t]+/, "", rest)
             key = rest; sub(/[ \t].*$/, "", key)
             cmd = rest; sub(/^[^ \t]+[ \t]+/, "", cmd)
-            # Expand config variables ($term, ...); i3-msg does not know them.
+            # Expand config variables ($term, ...); swaymsg does not know them.
             for (i = nvars; i >= 1; i--) {
                 v = order[i]
                 if (v == "$mod") continue
@@ -222,20 +212,20 @@ i3_rows() {
             if (desc == "") desc = label(cmd)
 
             if (mode != "") {
-                emit("i3-windows", mode " mode", pretty_key(key), desc, "copy", pretty_key(key))
+                emit("sway-windows", mode " mode", pretty_key(key), desc, "copy", pretty_key(key))
             }
             # Repetitive bindings collapse into one summary row each.
-            else if (cmd ~ /^workspace number /) { if (!seen["ws"]++) emit("i3-windows", wm, "Super+1..0", "Switch to workspace 1-10", "copy", "Super+1..0") }
-            else if (cmd ~ /^move container to workspace /) { if (!seen["mv"]++) emit("i3-windows", wm, "Super+Shift+1..0", "Move window to workspace 1-10", "copy", "Super+Shift+1..0") }
-            else if (cmd ~ /^focus (left|right|up|down)$/) { if (!seen["fo"]++) emit("i3-windows", wm, "Super+Arrows", "Focus window left / down / up / right", "copy", "Super+Arrows") }
-            else if (cmd ~ /^move (left|right|up|down)$/) { if (!seen["mw"]++) emit("i3-windows", wm, "Super+Shift+Arrows", "Move window left / down / up / right", "copy", "Super+Shift+Arrows") }
-            else emit(category(cmd, key), wm, pretty_key(key), desc, "i3", cmd)
+            else if (cmd ~ /^workspace number /) { if (!seen["ws"]++) emit("sway-windows", wm, "Super+1..0", "Switch to workspace 1-10", "copy", "Super+1..0") }
+            else if (cmd ~ /^move container to workspace /) { if (!seen["mv"]++) emit("sway-windows", wm, "Super+Shift+1..0", "Move window to workspace 1-10", "copy", "Super+Shift+1..0") }
+            else if (cmd ~ /^focus (left|right|up|down)$/) { if (!seen["fo"]++) emit("sway-windows", wm, "Super+Arrows", "Focus window left / down / up / right", "copy", "Super+Arrows") }
+            else if (cmd ~ /^move (left|right|up|down)$/) { if (!seen["mw"]++) emit("sway-windows", wm, "Super+Shift+Arrows", "Move window left / down / up / right", "copy", "Super+Shift+Arrows") }
+            else emit(category(cmd, key), wm, pretty_key(key), desc, "sway", cmd)
         }
         if (line != "") prev = line
     }
     END {
-        emit("i3-windows", wm, "Super+drag", "Move a floating window with the mouse (right button resizes)", "copy", "Super+drag")
-    }' "$I3_CONFIG"
+        emit("sway-windows", wm, "Super+drag", "Move a floating window with the mouse (right button resizes)", "copy", "Super+drag")
+    }' "$SWAY_CONFIG"
 }
 
 # ============================================================ ghostty
@@ -571,7 +561,7 @@ tsv_rows() {
 cache_fresh() {
     [ -s "$CACHE" ] || return 1
     local newer
-    newer=$(find "$SELF" "$I3_CONFIG" "$TMUX_CONF" "$GHOSTTY_CONFIG" "$YAZI_KEYMAP" "$DATA_DIR" \
+    newer=$(find "$SELF" "$SWAY_CONFIG" "$TMUX_CONF" "$GHOSTTY_CONFIG" "$YAZI_KEYMAP" "$DATA_DIR" \
         "$NVIM_LUA" "$(command -v ghostty 2>/dev/null || echo /nonexistent)" \
         -newer "$CACHE" -print -quit 2>/dev/null)
     [ -z "$newer" ]
@@ -582,7 +572,7 @@ build_cache() {
     local tmp
     tmp=$(mktemp "$CACHE_DIR/rows.XXXXXX") || return 1
     {
-        i3_rows; tsv_rows; ghostty_rows_cached; tmux_rows; nvim_rows; yazi_rows
+        sway_rows; tsv_rows; ghostty_rows_cached; tmux_rows; nvim_rows; yazi_rows
     } | awk -F'\t' -v order="$(cat_ids)" '
         BEGIN { n = split(order, o, "\n"); for (i = 1; i <= n; i++) idx[o[i]] = i }
         NF >= 5 && $3 != "" { c = ($1 in idx) ? idx[$1] : n + 1; rows[c] = rows[c] $0 "\n" }
@@ -624,7 +614,7 @@ render_rows() { # render_rows <cat>
         n = split(cats, c, "\n")
         for (i = 1; i <= n; i++) { split(c[i], f, "|"); icon[f[1]] = f[2]; color[f[1]] = f[3] }
         split(kinds, k, "|")
-        kicon["i3"] = k[1]; kcol["i3"] = "#a3be8c"
+        kicon["sway"] = k[1]; kcol["sway"] = "#a3be8c"
         kicon["term"] = k[2]; kcol["term"] = "#88c0d0"
         kicon["launch"] = k[3]; kcol["launch"] = "#a3be8c"
         kicon["copy"] = k[4]; kcol["copy"] = "#4c566a"
@@ -644,25 +634,17 @@ row_at() { # row_at <cat> <index>: print the TSV row
 run_row() { # run_row <kind> <action>
     local kind=$1 action=$2
     case "$kind" in
-        i3)
-            "$WM_MSG" -q -- "$action" ;;
+        sway)
+            swaymsg -q -- "$action" ;;
         launch)
-            if [ "$WM_NAME" = i3 ]; then
-                i3-msg -q -- "exec --no-startup-id $action"
-            else
-                swaymsg -q -- "exec $action"
-            fi ;;
+            swaymsg -q -- "exec $action" ;;
         term)
             setsid -f ghostty --class="$POPUP_CLASS" --window-width=0 --window-height=0 \
                 --title="$action" \
                 -e fish -c "$action; echo; read -P 'Press Enter to close ' -l _answer" \
                 >/dev/null 2>&1 ;;
         copy)
-            if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-                printf '%s' "$action" | wl-copy
-            else
-                printf '%s' "$action" | xclip -selection clipboard
-            fi
+            printf '%s' "$action" | wl-copy
             notify-send -a "Shortcuts" -i edit-copy -t 3000 "Copied to clipboard" "$action" 2>/dev/null || true ;;
     esac
 }
@@ -712,7 +694,7 @@ case "${1:-}" in
         row=$(row_at "${2:?category}" "${3:?index}")
         [ -n "$row" ] || { echo "no such row" >&2; exit 1; }
         run_row "$(cut -f5 <<<"$row")" "$(cut -f6- <<<"$row")" ;;
-    --category) menu "${2:?category id (all, i3-apps, nvim, tmux, ...)}" ;;
+    --category) menu "${2:?category id (all, sway-apps, nvim, tmux, ...)}" ;;
     "") menu ;;
     *) echo "usage: shortcuts-menu [--category CAT|--list|--counts|--rebuild|--render [cats|CAT]|--run CAT N]" >&2; exit 2 ;;
 esac

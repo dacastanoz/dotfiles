@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
 # Publish this Sway session's environment to D-Bus and systemd user services, then
 # undo it when Sway exits. The user manager lingers across logins, so without the
-# undo these values would still be set for services started under another session.
+# undo these values would still be set for services started outside this session.
 set -u
 
 # Variables that only make sense inside this session.
 SESSION_VARS=(WAYLAND_DISPLAY SWAYSOCK I3SOCK DISPLAY XCURSOR_THEME XCURSOR_SIZE
               XDG_CURRENT_DESKTOP ELECTRON_OZONE_PLATFORM_HINT MOZ_ENABLE_WAYLAND)
 PORTALS=(xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk)
-I3_UNIT=i3-graphical-session.service
 SWAY_UNIT=sway-graphical-session.service
 
 dbus-update-activation-environment --systemd --all
 
-# Hold graphical-session.target for Sway. Start this unit before stopping the i3 one
-# (enabled by default.target, so it runs from boot): the target stays up throughout,
-# and services bound to it are not restarted.
+# Hold graphical-session.target for Sway.
 systemctl --user start "$SWAY_UNIT"
-systemctl --user stop "$I3_UNIT"
 
 # A portal started by an earlier session keeps its old XDG_CURRENT_DESKTOP, which
 # breaks screen sharing. Stopped portals start again on demand with the new values.
 systemctl --user stop "${PORTALS[@]}"
 
 # GTK reads these from gsettings on Wayland instead of gtk-3.0/settings.ini. These are
-# the settings.ini values, so i3, which reads settings.ini, sees no difference.
+# the settings.ini values.
 # Theme, icons and cursor already matched.
 gsettings set org.gnome.desktop.interface font-name 'Fira Sans 10'
 gsettings set org.gnome.desktop.interface font-hinting 'full'
@@ -35,8 +31,4 @@ swaymsg -t subscribe '["shutdown"]' >/dev/null 2>&1
 
 systemctl --user unset-environment "${SESSION_VARS[@]}"
 systemctl --user stop "${PORTALS[@]}"
-# Hand the target back if the i3 unit is still in use (finish-migration disables it).
-if systemctl --user is-enabled --quiet "$I3_UNIT" 2>/dev/null; then
-    systemctl --user start "$I3_UNIT"
-fi
 systemctl --user stop "$SWAY_UNIT"

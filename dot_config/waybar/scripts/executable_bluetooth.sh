@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Polybar Bluetooth indicator.
+# Bar Bluetooth indicator.
 #   no output state   -> adapter missing
 #   󰂲  grey          -> powered off / blocked
 #   󰂯              -> on, nothing connected

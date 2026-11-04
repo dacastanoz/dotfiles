@@ -23,7 +23,6 @@
 set -u
 
 APP="Control Center"
-POSTSWITCH="$HOME/.config/autorandr/postswitch"
 
 notify() { # notify <icon> <summary> [body]
     notify-send -a "$APP" -i "$1" "$2" "${3:-}" 2>/dev/null || true
@@ -377,178 +376,12 @@ audio_menu() { device_menu sink "${1:-}"; }
 mic_menu()   { device_menu source; }
 
 # ============================================================ displays
-internal_output() {
-    xrandr --query | awk '/ connected/ && $1 ~ /^(eDP|LVDS|DSI)/ {print $1; exit}'
-}
-
-external_output() {
-    xrandr --query | awk '/ connected/ && $1 !~ /^(eDP|LVDS|DSI)/ {print $1; exit}'
-}
-
-# Modes of an output as "WxH<TAB>rate<TAB>flags" (flags: * current, + preferred).
-output_modes() { # output_modes <output>
-    xrandr --query | awk -v o="$1" '
-        $1==o {inside=1; next}
-        inside && /^[^ \t]/ {inside=0}
-        inside && $1 ~ /^[0-9]+x[0-9]+/ {
-            res=$1
-            for (i=2; i<=NF; i++) {
-                r=$i; f=""
-                if (r ~ /\*/) f=f "*"
-                if (r ~ /\+/) f=f "+"
-                gsub(/[*+]/, "", r)
-                if (r != "" && !seen[res "@" r]++) printf "%s\t%s\t%s\n", res, r, f
-            }
-        }'
-}
-
-after_layout_change() {
-    [ -x "$POSTSWITCH" ] && AUTORANDR_CURRENT_PROFILE="$1" "$POSTSWITCH"
-}
-
-apply_layout() { # apply_layout <extend-right|extend-left|mirror|external|laptop>
-    local int ext rc
-    int=$(internal_output); ext=$(external_output)
-    if [ -z "$ext" ] && [ "$1" != laptop ]; then
-        notify video-display "Displays" "No external display detected"
-        return
-    fi
-    case "$1" in
-        extend-right) xrandr --output "$int" --auto --primary --output "$ext" --auto --right-of "$int" ;;
-        extend-left)  xrandr --output "$int" --auto --primary --output "$ext" --auto --left-of "$int" ;;
-        mirror)
-            # Mirror at the laptop resolution; scale the external if it lacks that mode.
-            local res
-            res=$(output_modes "$int" | awk -F'\t' '$3 ~ /\+/ {print $1; exit}')
-            res=${res:-1920x1080}
-            if output_modes "$ext" | awk -F'\t' -v r="$res" '$1==r{f=1} END{exit !f}'; then
-                xrandr --output "$int" --auto --primary --output "$ext" --mode "$res" --same-as "$int"
-            else
-                xrandr --output "$int" --auto --primary --output "$ext" --auto --scale-from "$res" --same-as "$int"
-            fi ;;
-        external)     xrandr --output "$ext" --auto --primary --output "$int" --off ;;
-        laptop)
-            if [ -n "$ext" ]; then
-                xrandr --output "$int" --auto --primary --output "$ext" --off
-            else
-                xrandr --output "$int" --auto --primary
-            fi ;;
-    esac
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-        after_layout_change "$1"
-    else
-        notify dialog-error "Displays" "xrandr failed for layout '$1'"
-    fi
-}
-
-resolution_menu() {
-    local ext modes choice res rate
-    ext=$(external_output)
-    if [ -z "$ext" ]; then
-        notify video-display "Displays" "No external display detected"
-        return
-    fi
-    modes=$(output_modes "$ext")
-    choice=$(while IFS=$'\t' read -r res rate flags; do
-        local label="$res @ ${rate} Hz"
-        [[ "$flags" == *"+"* ]] && label="$label (preferred)"
-        [[ "$flags" == *"*"* ]] && label="* $label"
-        row "$label" video-display
-    done <<<"$modes" | rofi_menu "$ext resolution") || return 0
-    choice=${choice#"* "}
-    res=${choice%% @ *}
-    rate=${choice#* @ }; rate=${rate%% Hz*}
-    if xrandr --output "$ext" --mode "$res" --rate "$rate"; then
-        after_layout_change "$ext $res@$rate"
-    else
-        notify dialog-error "Displays" "Could not set $res @ $rate Hz on $ext"
-    fi
-}
-
-save_profile_menu() {
-    local name
-    name=$(rofi -dmenu -p "Profile name" -mesg "Saved layouts are re-applied automatically when the same monitors are connected" </dev/null) || return 0
-    name=$(tr -cd 'A-Za-z0-9._-' <<<"$name")
-    [ -z "$name" ] && return 0
-    if autorandr --save "$name" --force >/dev/null 2>&1; then
-        notify video-display "Display profile saved" "$name"
-    else
-        notify dialog-error "Displays" "Could not save profile $name"
-    fi
-}
-
-load_profile_menu() {
-    local choice
-    choice=$(autorandr --list 2>/dev/null | while read -r p; do row "$p" video-display; done |
-        rofi_menu "Load profile") || return 0
-    if autorandr --load "$choice" >/dev/null 2>&1; then
-        notify video-display "Display profile" "$choice"
-    else
-        notify dialog-error "Displays" "Could not load profile $choice"
-    fi
-}
-
-# Global UI scale for X11 (Xft.dpi): 96 = 100 %, 144 = 150 %.
-# Persisted in ~/.Xresources (loaded by the display manager at login).
-current_dpi() {
-    local d
-    d=$(xrdb -query 2>/dev/null | awk '/^Xft.dpi:/{print $2; exit}')
-    echo "${d:-96}"
-}
-
-set_scale() { # set_scale <dpi> <polybar-height>
-    local file="$HOME/.Xresources" tmp
-    tmp=$(mktemp)
-    [ -f "$file" ] && grep -v -e '^Xft.dpi:' -e '^polybar.height:' "$file" >"$tmp"
-    printf 'Xft.dpi: %s\npolybar.height: %s\n' "$1" "$2" >>"$tmp"
-    mv "$tmp" "$file"
-    xrdb -merge "$file"
-    "$HOME/.config/polybar/launch.sh" >/dev/null 2>&1 &
-    notify preferences-desktop-display "UI scale set to $(( $1 * 100 / 96 ))%" \
-        "Bar updated now. Restart apps (or log out) to rescale everything; \$mod+Shift+r restarts i3."
-}
-
-displays_menu() {
-    # Under Sway: layouts, per-screen scale and kanshi profiles live in this script.
-    if [ -n "${SWAYSOCK:-}" ]; then
-        "$HOME/.config/sway/scripts/displays"
-        return
-    fi
-    local ext int dpi scale_row choice
-    int=$(internal_output); ext=$(external_output)
-    dpi=$(current_dpi)
-    if [ "$dpi" -gt 100 ]; then scale_row="UI scale: 150% -> 100%"; else scale_row="UI scale: 100% -> 150% (HiDPI / 4K)"; fi
-    choice=$({
-        row "Extend right" video-display
-        row "Extend left" video-display
-        row "Mirror" video-display
-        row "External only" video-display
-        row "Laptop only" computer-laptop
-        row "External resolution / refresh..." preferences-desktop-display
-        row "$scale_row" zoom-in
-        row "Save layout as profile..." document-save
-        row "Load saved profile..." document-open
-        row "Open display settings (arandr)" preferences-desktop-display
-    } | rofi_menu "Displays" "Laptop: <b>${int:-none}</b>   External: <b>${ext:-not connected}</b>   Profile: <b>$(autorandr --current 2>/dev/null | head -1)</b>") || return 0
-    case "$choice" in
-        "Extend right")  apply_layout extend-right ;;
-        "Extend left")   apply_layout extend-left ;;
-        "Mirror")        apply_layout mirror ;;
-        "External only") apply_layout external ;;
-        "Laptop only")   apply_layout laptop ;;
-        "External resolution / refresh...") resolution_menu ;;
-        "UI scale: 150%"*) set_scale 96 24 ;;
-        "UI scale: 100%"*) set_scale 144 34 ;;
-        "Save layout as profile...") save_profile_menu ;;
-        "Load saved profile...") load_profile_menu ;;
-        "Open display settings (arandr)") arandr >/dev/null 2>&1 & ;;
-    esac
-}
+# Layouts, scale per screen and kanshi profiles live in the Sway displays script.
+displays_menu() { "$HOME/.config/sway/scripts/displays"; }
 
 # ============================================================ connection details
 # Secrets (Wi-Fi password) are only read on an explicit action. They are passed
-# through stdin (rofi rows, qrencode, xclip), never as command-line arguments.
+# through stdin (rofi rows, qrencode, wl-copy), never as command-line arguments.
 declare -A CD=()
 CLIP_CLEAR_SECONDS=45
 
@@ -669,17 +502,8 @@ details_text() {
 # Text for "Copy all details": same as details_text, without the password line.
 details_plain() { details_text | grep -v '^Password:'; }
 
-# Reads stdin. wl-copy is the Wayland clipboard; xclip is kept for an i3 session.
-clip_set() {
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        wl-copy >/dev/null 2>&1
-    else
-        xclip -selection clipboard -i >/dev/null 2>&1
-    fi
-}
-clip_get() {
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then wl-paste -n 2>/dev/null; else xclip -o -selection clipboard 2>/dev/null; fi
-}
+clip_set() { wl-copy >/dev/null 2>&1; } # reads stdin
+clip_get() { wl-paste -n 2>/dev/null; }
 
 # Copy a secret from stdin; clear it after CLIP_CLEAR_SECONDS if still unchanged.
 copy_secret() {
@@ -695,13 +519,13 @@ copy_secret() {
 
 qr_viewer() {
     local v
-    for v in imv feh eog; do command -v "$v" >/dev/null 2>&1 && { echo "$v"; return 0; }; done
+    for v in imv eog; do command -v "$v" >/dev/null 2>&1 && { echo "$v"; return 0; }; done
     return 1
 }
 
 show_wifi_qr() {
     local viewer f psk=""
-    viewer=$(qr_viewer) || { notify dialog-error "Wi-Fi QR code" "No image viewer found (imv, feh or eog)"; return; }
+    viewer=$(qr_viewer) || { notify dialog-error "Wi-Fi QR code" "No image viewer found (imv or eog)"; return; }
     [ "$(security_kind "${CD[802-11-wireless-security.key-mgmt]:-}")" = psk ] && psk=$(wifi_psk "${CD[uuid]}")
     f=$(umask 077; mktemp --suffix=.png "${XDG_RUNTIME_DIR:-/tmp}/wifi-qr.XXXXXX") || return
     chmod 600 "$f"
@@ -715,7 +539,6 @@ show_wifi_qr() {
     # The PNG is deleted as soon as the viewer window is closed.
     (
         case "$viewer" in
-            feh) feh --title "Wi-Fi QR code" --image-bg white "$f" ;;
             eog) eog --new-instance "$f" ;;
             *)   "$viewer" "$f" ;;
         esac
