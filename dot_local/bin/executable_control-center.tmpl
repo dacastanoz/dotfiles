@@ -510,6 +510,11 @@ set_scale() { # set_scale <dpi> <polybar-height>
 }
 
 displays_menu() {
+    # Under Sway: layouts, per-screen scale and kanshi profiles live in this script.
+    if [ -n "${SWAYSOCK:-}" ]; then
+        "$HOME/.config/sway/scripts/displays"
+        return
+    fi
     local ext int dpi scale_row choice
     int=$(internal_output); ext=$(external_output)
     dpi=$(current_dpi)
@@ -664,7 +669,17 @@ details_text() {
 # Text for "Copy all details": same as details_text, without the password line.
 details_plain() { details_text | grep -v '^Password:'; }
 
-clip_set() { xclip -selection clipboard -i >/dev/null 2>&1; } # reads stdin
+# Reads stdin. wl-copy is the Wayland clipboard; xclip is kept for an i3 session.
+clip_set() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        wl-copy >/dev/null 2>&1
+    else
+        xclip -selection clipboard -i >/dev/null 2>&1
+    fi
+}
+clip_get() {
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then wl-paste -n 2>/dev/null; else xclip -o -selection clipboard 2>/dev/null; fi
+}
 
 # Copy a secret from stdin; clear it after CLIP_CLEAR_SECONDS if still unchanged.
 copy_secret() {
@@ -672,7 +687,7 @@ copy_secret() {
     hash=$(tee >(clip_set) | sha256sum | cut -d' ' -f1)
     (
         sleep "$CLIP_CLEAR_SECONDS"
-        [ "$(xclip -o -selection clipboard 2>/dev/null | sha256sum | cut -d' ' -f1)" = "$hash" ] &&
+        [ "$(clip_get | sha256sum | cut -d' ' -f1)" = "$hash" ] &&
             clip_set </dev/null
     ) >/dev/null 2>&1 &
     disown

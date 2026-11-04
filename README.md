@@ -1,6 +1,6 @@
-# dotfiles: CachyOS + i3 desktop
+# dotfiles: CachyOS + Sway desktop
 
-A lightweight, Nord-themed i3 desktop for CachyOS, managed with [chezmoi](https://www.chezmoi.io/).
+A lightweight, Nord-themed Sway desktop for CachyOS, managed with [chezmoi](https://www.chezmoi.io/).
 One command installs the packages, the user configs and the system tweaks, and adapts them to the machine
 (laptop or desktop, Wi-Fi, Bluetooth, AMD or Intel).
 
@@ -27,9 +27,9 @@ chezmoi apply                                             # when you are happy
 | Step | Script / files | Result |
 |------|----------------|--------|
 | 1. Packages | `run_once_before_00-packages.sh` + `packages/*.txt` | pacman, AUR (paru) and brew packages; only missing ones are installed |
-| 2. Dotfiles | `dot_config/`, `dot_local/`, `dot_gtkrc-2.0` | i3, polybar, rofi, dunst, picom, ghostty, yazi, Thunar, GTK/Qt theme, btop, scripts |
-| 3. System | `run_onchange_after_10-system.sh` + `system/` | sysctl, journald, oomd, watchdog, thermal guard, NetworkManager, Bluetooth, kernel cmdline |
-| 4. User | `run_onchange_after_20-user.sh` | user units, icon folder color, gsettings, i3 reload |
+| 2. Dotfiles | `dot_config/`, `dot_local/`, `dot_gtkrc-2.0` | Sway, Waybar, kanshi, wob, rofi, dunst, ghostty, yazi, Thunar, GTK/Qt theme, btop, scripts |
+| 3. System | `run_onchange_after_10-system.sh` + `system/` | sysctl, journald, oomd, watchdog, thermal guard, NetworkManager, Bluetooth, pointer access for the shake gesture, kernel cmdline |
+| 4. User | `run_onchange_after_20-user.sh` | user units, icon folder color, gsettings, Sway reload (only if `sway -C` passes) |
 
 Every `/etc` file that gets replaced is backed up once as `<file>.bak-chezmoi`.
 Scripts are idempotent: running `chezmoi apply` again only changes what differs.
@@ -40,14 +40,14 @@ Detected automatically by `.chezmoi.toml.tmpl` at `chezmoi init` (no prompts):
 
 | Detected | How | What changes |
 |----------|-----|--------------|
-| Battery (`hasBattery`) | `/sys/class/power_supply/*/type = Battery` | polybar battery modules, battery menu (`$mod+Shift+b`), auto power profile on AC/battery, low-battery alerts, health history |
-| Wi-Fi (`hasWifi`) | `/sys/class/net/*/wireless` | polybar network module, control-center Wi-Fi rows, NetworkManager tweaks |
-| Bluetooth (`hasBluetooth`) | `/sys/class/bluetooth/*` | blueman/bluez packages, polybar module, control-center rows, `$mod+b`, `main.conf` |
+| Battery (`hasBattery`) | `/sys/class/power_supply/*/type = Battery` | Waybar battery modules, battery menu (`$mod+Shift+b`), auto power profile on AC/battery, low-battery alerts, health history |
+| Wi-Fi (`hasWifi`) | `/sys/class/net/*/wireless` | Waybar network module, control-center Wi-Fi rows, NetworkManager tweaks |
+| Bluetooth (`hasBluetooth`) | `/sys/class/bluetooth/*` | blueman/bluez packages, Waybar module, control-center rows, `$mod+b`, `main.conf` |
 | AMD Ryzen (`hasRyzen`) | `/proc/cpuinfo` vendor | hardware watchdog (`sp5100_tco`, only if it loads) |
 | AMD laptop (`isAMDLaptop`) | Ryzen + battery | `ryzenadj` power/thermal limits |
 | Acer laptop (`isAcerLaptop`) | DMI vendor + battery | `acer-wmi-battery-dkms` 80 % charge limit |
 | AMD GPU (`hasAMDGPU`) | DRM vendor `0x1002` | `amdgpu.gpu_recovery=1` on the kernel cmdline |
-| CPU sensor (`cpuSensor`) | hwmon `k10temp` / `coretemp` / `zenpower` | polybar temperature, btop sensor, thermal guard (k10temp only) |
+| CPU sensor (`cpuSensor`) | hwmon `k10temp` / `coretemp` / `zenpower` | Waybar temperature, btop sensor, thermal guard (k10temp only) |
 | limine (`hasLimine`) | `/etc/default/limine` | kernel cmdline edits + `limine-update` |
 
 See the values for this machine with `chezmoi data | grep -A20 '"hasBattery"'`.
@@ -58,10 +58,11 @@ After a hardware change, refresh them with `chezmoi init && chezmoi apply`.
 - [ ] **Google Drive sync** (optional): `rclone config` to create the remotes, then
   `cp ~/.config/drive-sync/remotes.conf.example ~/.config/drive-sync/remotes.conf`, edit it,
   run `drive-sync --resync <name>` once per remote and `chezmoi apply` (enables `drive-sync.timer`).
-- [ ] **Displays**: arrange screens (`$mod+p` or `arandr`), then `autorandr --save <name>` (profiles are per machine and not in the repo).
-- [ ] **Wallpaper**: put an image at `~/.config/i3/wallpaper.png` (not shipped).
+- [ ] **Displays**: kanshi applies `mobile` (laptop only) or `docked` (any external screen on the right, scale 1.25) by itself. Arrange screens with `$mod+p` or `wdisplays`, then use "Save layout as profile..." in the Displays menu (saved profiles are per machine, in `~/.config/kanshi/profiles.d/`, and not in the repo).
+- [ ] **Wallpaper**: put an image at `~/.config/sway/wallpaper.png` (not shipped).
 - [ ] **Terminal toolkit**: install [Gentleman.Dots](https://github.com/Gentleman-Programming/Gentleman.Dots) with its own installer (nvim, tmux, fish, starship, ghostty shaders).
 - [ ] **Browser**: Chrome/Brave, Settings > Performance > Memory Saver on (RAM is tight on 8 GB laptops).
+- [ ] **Personal bookmarks** (optional): GTK bookmark lines in `~/.config/gtk-3.0/bookmarks.local` are added to the generated list at each `chezmoi apply` (not in the repo).
 - [ ] **Reboot**: needed for the kernel cmdline, watchdog and Wi-Fi driver options (the system script lists them).
 
 ## Daily use
@@ -70,8 +71,8 @@ After a hardware change, refresh them with `chezmoi init && chezmoi apply`.
 |------|---------|
 | Pull and apply the latest repo | `chezmoi update` |
 | See what differs on this machine | `chezmoi diff` |
-| Save a config you changed on this machine | `chezmoi re-add ~/.config/i3/config` (plain files) or `chezmoi edit ~/.config/polybar/config.ini` (templates) |
-| Publish your changes | `chezmoi cd && git add -A && git commit -m "feat(i3): ..." && git push` |
+| Save a config you changed on this machine | `chezmoi re-add ~/.config/waybar/style.css` (plain files) or `chezmoi edit ~/.config/sway/config` (templates) |
+| Publish your changes | `chezmoi cd && git add -A && git commit -m "feat(sway): ..." && git push` |
 | Add a new file | `chezmoi add ~/.config/foo/bar.conf` |
 
 Templates (`*.tmpl`) cannot be re-added: edit them with `chezmoi edit` so the machine conditions survive.
@@ -91,6 +92,9 @@ Templates (`*.tmpl`) cannot be re-added: edit them with `chezmoi edit` so the ma
 | `$mod+Shift+t` | Temperature and system monitor |
 | `$mod+Shift+b` | Battery menu (laptops) |
 | `$mod+Shift+e` | Power menu |
+| `$mod+Shift+j` | Background apps: list, and stop one |
+| Three-finger swipe left / right / up | Next / previous workspace / fullscreen |
+| Four-finger swipe up | Control center |
 | `$mod+F1` | Shortcuts menu |
 | `$mod+g` / `$mod+y` / `$mod+o` | lazygit / yazi / Neovim project picker popups |
 
@@ -115,8 +119,9 @@ The ryzenadj limits were tuned for a 15 W Ryzen 7 5700U. On a different APU revi
 |-----------------|---------------------------|
 | `~/.config/rclone/rclone.conf`, `remotes.conf`, bisync state | OAuth tokens and personal folder names |
 | NetworkManager connections, keyrings, SSH/GPG, `gh`/cloud CLI configs | secrets |
-| autorandr profiles | contain monitor EDIDs, per machine |
-| nvim, tmux, fish (except `functions/y.fish`), starship, ghostty shaders | owned by Gentleman.Dots and its installer |
+| Saved kanshi profiles (`~/.config/kanshi/profiles.d/`) | contain monitor serials, per machine |
+| Personal GTK bookmarks (`~/.config/gtk-3.0/bookmarks.local`) | personal folder names |
+| nvim, fish (except `functions/y.fish`), starship, ghostty shaders | owned by Gentleman.Dots and its installer |
 | Browser profiles, caches, logs, `*.bak*` files | machine state |
 | Wallpaper | image license unknown |
 

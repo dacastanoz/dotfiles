@@ -1,4 +1,4 @@
-# Desktop cheatsheet (i3 on CachyOS)
+# Desktop cheatsheet (Sway on CachyOS)
 
 Every keybind and menu of this setup. Items marked *laptop*, *Bluetooth* or *Acer* only exist on machines where that hardware is detected.
 
@@ -15,24 +15,30 @@ Every keybind and menu of this setup. Items marked *laptop*, *Bluetooth* or *Ace
 | `$mod+i` | Connection details: IP, DNS, signal, Wi-Fi password, QR code to share Wi-Fi |
 | `$mod+Shift+a` | Audio output picker (speakers / HDMI / headset / BT, card profiles) |
 | `$mod+Shift+i` | Microphone picker |
-| `$mod+p` | Displays menu (extend, mirror, external/laptop only, resolution, UI scale, profiles) |
-| `$mod+ctrl+p`, `Fn` display key | Old quick cycle (display-toggle): laptop -> extend -> mirror -> external only |
+| `$mod+p` | Displays menu (extend, mirror, external/laptop only, resolution, per-screen scale, kanshi profiles, wdisplays) |
+| `$mod+ctrl+p`, `Fn` display key | Quick cycle (display-toggle): laptop -> extend -> mirror -> external only, switching the audio output too |
 | `$mod+n` | Thunar file manager |
 | `$mod+b` | Bluetooth manager (blueman) |
-| `$mod+Shift+e` | Power menu (lock / logout / suspend / reboot / shutdown) |
-| `$mod+l` | Lock screen, unchanged |
+| `$mod+Shift+e` | Power menu (lock / logout / reboot / shutdown, plus suspend when the system allows it) |
+| `$mod+Shift+j` | **Background apps**: apps running with no window; pick one, confirm, and it gets SIGTERM |
+| `$mod+l` | Lock screen (swaylock). Nothing locks automatically |
 | `$mod+Shift+p` | Calculator (gnome-calculator, now installed) |
 | `$mod+Shift+t` | Temperature / system monitor (btop with live CPU + temperature graphs, floating) |
 | `$mod+Shift+b` | **Battery menu**: health, 80 % charge limit, power profile, calibration |
 | `Alt+SysRq` + `R E I S U B` | Emergency safe reboot when the desktop is frozen but the kernel is alive (hold Alt+SysRq/PrtSc, type the letters ~1 s apart) |
 | `$mod+grave` / `$mod+Shift+grave` | Close all notifications / show the last one again |
 | Media keys | play-pause / next / previous (playerctl) |
-| Volume / brightness keys | unchanged (xob OSD) |
+| Volume / brightness keys | wob bar on the right edge; volume boost up to 250 %, red above 100 % |
 | `Fn` airplane key | the kernel toggles the radios; a notification shows the new state |
-| `Print` / `Shift+Print` | Screenshot area to clipboard / full screen to ~/Pictures/Screenshots, unchanged |
-| `Alt+Shift+space` | Switch keyboard layout latam <-> us, unchanged |
+| `Print` / `Shift+Print` | Screenshot area to clipboard / full screen to ~/Pictures/Screenshots (grim, slurp, wl-copy) |
+| `Alt+Shift+space` | Switch keyboard layout latam <-> us |
+| Three-finger swipe left / right | Next / previous workspace on this screen |
+| Three-finger swipe up | Fullscreen (toggle) |
+| Four-finger swipe up | Control center |
+| Shake the pointer | The cursor grows for a moment so you can find it (`cursor-shake`) |
+| `$mod+Shift+r` | Reloads the config, like `$mod+Shift+c` (Sway has no in-place restart) |
 
-## Polybar (top bar)
+## Waybar (top bar)
 
 Left to right: Arch logo (click: launcher, right-click: control center), workspaces (click to switch), CPU, RAM, clock (click: long format), updates (click: opens `paru`), airplane icon (only shown when airplane mode is on; click to turn it off), volume, Wi-Fi, Bluetooth, battery, keyboard icon (shortcuts / help menu), control center icon, power icon, tray.
 
@@ -40,18 +46,19 @@ Left to right: Arch logo (click: launcher, right-click: control center), workspa
 - Wi-Fi: shows the network name and signal %. Click for the network picker, middle-click for connection details, right-click to open the connection editor.
 - Bluetooth: click to open blueman, right-click to turn it on or off, middle-click for the paired devices menu.
 - Battery: percentage, then a yellow `󰌾80` when the 80 % limit is on and the power-profile glyph (󰌪 / 󰾅 / 󰓅). Click for the battery menu, right-click to cycle the power profile. Health appears here only if it falls below 60 %.
-- The tray is only on the laptop screen's bar. It holds nm-applet, blueman and udiskie (udiskie only appears when a drive is plugged in).
+- Background apps: amber icon and count, hidden when there are none. Hover for name, PID, age and memory; click for the picker, right-click for btop.
+- The tray is only on the laptop screen's bar, so "External only" has no tray. It holds nm-applet, blueman and udiskie (udiskie only appears when a drive is plugged in).
 
 - Temperature (after CPU): CPU temperature, green < 75°C, yellow ≥ 75, orange ≥ 85, red ≥ 90. It adds "throttled", "critical" or "OFF in Ns" when the thermal guard steps in. Click to open the live monitor (btop), right-click for a summary of every sensor (CPU, GPU + package watts, NVMe, Wi-Fi, CPU frequency, power profile, boost, ryzenadj limits, guard level).
 
 ## Shortcuts / help menu (`$mod+F1` or the keyboard icon in the bar)
 
 - First screen: categories with their own icon, color and row count. "All" searches everything at once. Inside a list, type to fuzzy-search keys, commands or descriptions; `Esc` goes back to the categories.
-- Row marks: green play = runs the i3 binding (exactly what the key does), blue terminal = runs the command in a floating ghostty popup (`sudo` ones ask for the password there; press Enter to close), green arrow = opens a program or folder, grey copy = information only (Enter copies the key/command and shows a notification).
-- Categories: i3 apps & launchers, i3 windows & workspaces (incl. resize-mode keys), System & connections, Media & screenshots, Monitoring, Files & apps (Thunar folders, Notion, WhatsApp, VS Code, Obsidian, Chrome, Thunar keys), Dev toolkit, Terminal commands, Ghostty, tmux, Neovim / LazyVim, yazi, lazygit, Shell (fish, zoxide, atuin, fzf).
-- It stays in sync on its own: i3 rows are read from `~/.config/i3/config` (label = the `# desc: ...` comment above a `bindsym`), ghostty rows from `ghostty +list-keybinds`, tmux rows from `~/.tmux.conf`, Neovim rows from `~/.config/nvim/lua` (disabled plugins skipped), yazi custom keys from its keymap.toml.
+- Row marks: green play = runs the Sway binding (exactly what the key does), blue terminal = runs the command in a floating ghostty popup (`sudo` ones ask for the password there; press Enter to close), green arrow = opens a program or folder, grey copy = information only (Enter copies the key/command and shows a notification).
+- Categories: sway apps & launchers, sway windows & workspaces (incl. resize-mode keys), System & connections, Media & screenshots, Monitoring, Files & apps (Thunar folders, Notion, WhatsApp, VS Code, Obsidian, Chrome, Thunar keys), Dev toolkit, Terminal commands, Ghostty, tmux, Neovim / LazyVim, yazi, lazygit, Shell (fish, zoxide, atuin, fzf).
+- It stays in sync on its own: Sway rows are read from `~/.config/sway/config` (label = the `# desc: ...` comment above a `bindsym` or `bindgesture`), ghostty rows from `ghostty +list-keybinds`, tmux rows from `~/.tmux.conf`, Neovim rows from `~/.config/nvim/lua` (disabled plugins skipped), yazi custom keys from its keymap.toml.
 - Edit the curated lists in `~/.config/shortcuts-menu/*.tsv` (one file per category, `commands.tsv` = Terminal commands). Columns, TAB separated: section, key or command, description, optional kind (`term`, `launch`, `copy`), optional action.
-- To give a new i3 binding a clean label, put `# desc: What it does` on the line right above it.
+- To give a new Sway binding a clean label, put `# desc: What it does` on the line right above it.
 - Results are cached in `~/.cache/shortcuts-menu/` and rebuilt when any source changes. `shortcuts-menu --counts` shows rows per category; `shortcuts-menu --category nvim` opens one category directly.
 
 ## Overheating and freezes
@@ -94,15 +101,17 @@ Left to right: Arch logo (click: launcher, right-click: control center), workspa
   - Show QR code to share Wi-Fi: a phone camera scans it and joins the network. The image is deleted when you close its window.
   - Edit this connection, Copy all details (without the password).
   - Enterprise networks (802.1X) show the EAP method and your identity instead; there is no shared password to show.
-- **Displays**: layouts, the external monitor's resolution and refresh rate, UI scale 100% <-> 150%, saving and loading layouts as profiles, and arandr.
+- **Displays**: layouts, the external monitor's resolution and refresh rate, scale per screen, saving and loading layouts as kanshi profiles, and wdisplays.
 - CLI: `control-center [wifi|bluetooth|audio|mic|displays|details|airplane|radio-status|fix|status]`.
 
 ## Displays
 
-- autorandr applies a saved layout automatically when you plug in a monitor, log in or wake from sleep. Profiles are per machine: save one with `autorandr --save <name>` after arranging the screens. A monitor combination it doesn't know is extended horizontally.
-- After any layout change, `~/.config/autorandr/postswitch` restarts polybar and redraws the wallpaper.
-- UI scale: sets `Xft.dpi` (96 or 144) in `~/.Xresources`. On X11 this scale applies to all screens at once, not per monitor. The bar changes right away; other apps pick it up after a restart or a new login.
-- i3 workspaces are not tied to any output, so unplugging a monitor moves its workspaces to the screen that's left.
+- kanshi applies a profile by itself when screens change: `mobile` (laptop only), `desk-benq` (a saved 4K monitor on the right) or `docked` (any other external screen on the right at its preferred mode). Scale is 1.25; `~/.config/kanshi/config` explains how to change it.
+- Save the current layout from the Displays menu. Saved profiles go in `~/.config/kanshi/profiles.d/` and are per machine. Switch by hand with `kanshictl switch <name>`.
+- Scale is per screen, so the laptop and a 4K monitor can differ. Save a profile to keep a change.
+- Mirror uses `wl-mirror`, since Sway has no native mirroring. It shows the laptop screen fullscreen on the external one.
+- Waybar and the wallpaper follow screen changes by themselves.
+- Workspaces are not tied to any output, so unplugging a monitor moves its workspaces to the screen that's left.
 
 ## Files
 
@@ -114,7 +123,7 @@ Left to right: Arch logo (click: launcher, right-click: control center), workspa
 
 - Notion: opens as a Chrome app window. Look for "Notion" in the launcher.
 - Text, Markdown, JSON and code files open in VS Code by default. Folders open in Thunar.
-- DaVinci Resolve (not installed): i3 rules are ready. The main window has no border (`$mod+f` for fullscreen) and its dialogs and secondary windows float.
+- DaVinci Resolve (not installed): Sway rules are ready (it runs through XWayland). The main window has no border (`$mod+f` for fullscreen) and its dialogs and secondary windows float.
 
 ## Bluetooth audio
 
@@ -133,10 +142,10 @@ All terminal tools run in ghostty (Gentleman theme). Every normal fish terminal 
 | `$mod+y` | yazi in a floating popup |
 | `$mod+o` | Neovim quick-open: pick a project folder (zoxide + fzf), then nvim opens there (`nvim-project`) |
 
-- Popups use the ghostty class `dev.gentleman.popup` (i3 rule: floating, 80% of the screen, centered). Closing a popup with a running program asks for confirmation (ghostty).
+- Popups use the ghostty class `dev.gentleman.popup` (Sway rule on app_id: floating, 80% of the screen, centered). Closing a popup with a running program asks for confirmation (ghostty).
 - yazi: text/code files open in Neovim, everything else with xdg-open; `z` jumps with zoxide, `Z` with fzf; `Ctrl+n` dragon-drop, `Ctrl+t` terminal here, `Ctrl+e` Thunar. Colors follow the Gentleman terminal palette (`~/.config/yazi/theme.toml`). In fish, `y` runs yazi and leaves you in its last folder when you quit with `q`.
-- Terminal everywhere: i3, rofi (`terminal: ghostty`), Thunar "Open Terminal Here"/"Open in Neovim" (`ghostty --working-directory`), yazi `Ctrl+t`, and the GNOME/GIO default terminal (`gsettings ... default-applications.terminal exec ghostty`).
-- Theme: desktop (GTK, rofi, dunst, polybar) is Nord; terminal, tmux, nvim and yazi use the Gentleman palette. Both are dark and cool-toned, so they sit together fine. To fully align later, either switch ghostty/nvim to a Nord theme or recolor rofi/dunst/polybar with the Gentleman palette (not applied).
+- Terminal everywhere: Sway, rofi (`terminal: ghostty`), Thunar "Open Terminal Here"/"Open in Neovim" (`ghostty --working-directory`), yazi `Ctrl+t`, and the GNOME/GIO default terminal (`gsettings ... default-applications.terminal exec ghostty`).
+- Theme: desktop (GTK, rofi, dunst, Waybar) is Nord; terminal, tmux, nvim and yazi use the Gentleman palette. Both are dark and cool-toned, so they sit together fine. To fully align later, either switch ghostty/nvim to a Nord theme or recolor rofi/dunst/waybar with the Gentleman palette (not applied).
 
 ### Updating (in the future)
 

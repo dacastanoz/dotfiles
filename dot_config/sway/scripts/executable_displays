@@ -1,0 +1,297 @@
+#!/usr/bin/python3
+"""Display layouts for Sway, replacing the xrandr/autorandr control-center menu.
+
+    displays              rofi menu: layouts, resolution, scale, profiles, wdisplays
+    displays cycle        laptop -> extend -> mirror -> external only -> laptop;
+                          prints the new layout
+    displays <layout>     extend-right, extend-left, mirror, external, laptop
+
+Saved profiles are kanshi profiles in ~/.config/kanshi/profiles.d/. They apply again
+on their own whenever the same monitors are connected.
+"""
+import json
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+
+KANSHI_DIR = pathlib.Path.home() / ".config/kanshi"
+PROFILES_DIR = KANSHI_DIR / "profiles.d"
+INTERNAL = re.compile(r"^(eDP|LVDS|DSI)")
+CYCLE = ["laptop", "extend-right", "mirror", "external"]
+SCALES = ["1.0", "1.25", "1.5", "1.75", "2.0"]
+LAYOUT_LABELS = {
+    "extend-right": "Extended \u2192 right",
+    "extend-left": "Extended \u2192 left",
+    "mirror": "Mirror",
+    "external": "TV only",
+    "laptop": "Laptop only",
+}
+
+
+def roles(outputs):
+    """Return (internal output name, first external output name)."""
+    internal = next((o["name"] for o in outputs if INTERNAL.match(o["name"])), None)
+    external = next((o["name"] for o in outputs if not INTERNAL.match(o["name"])), None)
+    return internal, external
+
+
+def layout_commands(layout, internal, external, int_w, ext_w):
+    """Sway commands for a layout. A screen is enabled before another is disabled."""
+    if layout == "extend-right":
+        return [f"output {internal} enable position 0 0", f"output {external} enable position {int_w} 0"]
+    if layout == "extend-left":
+        return [f"output {external} enable position 0 0", f"output {internal} enable position {ext_w} 0"]
+    if layout == "external":
+        return [f"output {external} enable", f"output {internal} disable"]
+    if layout == "laptop":
+        cmds = [f"output {internal} enable"]
+        if external:
+            cmds.append(f"output {external} disable")
+        return cmds
+    if layout == "mirror":
+        return [f"output {internal} enable", f"output {external} enable"]
+    raise ValueError(layout)
+
+
+def next_layout(current):
+    return CYCLE[(CYCLE.index(current) + 1) % len(CYCLE)]
+
+
+def current_layout(outputs, mirroring):
+    internal, external = roles(outputs)
+    active = {o["name"] for o in outputs if o["active"]}
+    if internal in active and external in active:
+        return "mirror" if mirroring else "extend-right"
+    if external in active and internal not in active:
+        return "external"
+    return "laptop"
+
+
+def safe_name(name):
+    return re.sub(r"[^A-Za-z0-9._-]", "", name).replace("/", "")
+
+
+def _identity(output):
+    return f'"{output["make"]} {output["model"]} {output["serial"]}"'
+
+
+def render_profile(name, outputs):
+    lines = [f"profile {name} {{"]
+    for output in outputs:
+        if not output["active"]:
+            lines.append(f"    output {_identity(output)} disable")
+            continue
+        mode = output["current_mode"]
+        rect = output["rect"]
+        lines.append(f'    output {_identity(output)} enable '
+                     f'mode {mode["width"]}x{mode["height"]}@{mode["refresh"] / 1000:.3f}Hz '
+                     f'position {rect["x"]},{rect["y"]} scale {output["scale"]:g}')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_kanshi_status(text):
+    """The active profile from `kanshictl status`, or None."""
+    match = re.search(r"^Current profile:\s*(\S+)", text, re.M)
+    return match.group(1) if match else None
+
+
+def profile_names(config_text):
+    return re.findall(r"^\s*profile\s+([^\s{]+)\s*\{", config_text, re.M)
+
+
+# ---------------------------------------------------------------- system access
+def get_outputs():
+    out = subprocess.run(["swaymsg", "-t", "get_outputs", "-r"], capture_output=True, text=True, check=True)
+    return json.loads(out.stdout)
+
+
+def sway(command):
+    return subprocess.run(["swaymsg", command], capture_output=True, text=True).returncode == 0
+
+
+def notify(summary, body=""):
+    subprocess.run(["notify-send", "-a", "Displays", "-i", "video-display", summary, body], check=False)
+
+
+def rofi(prompt, rows, message=None):
+    cmd = ["rofi", "-dmenu", "-i", "-no-custom", "-p", prompt]
+    if message:
+        cmd += ["-mesg", message]
+    result = subprocess.run(cmd, input="\n".join(rows), capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def rofi_text(prompt):
+    result = subprocess.run(["rofi", "-dmenu", "-p", prompt, "-mesg",
+                             "Saved layouts apply again when the same monitors are connected"],
+                            input="", capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _pidfile():
+    return pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "displays-mirror.pid"
+
+
+def mirror_running():
+    try:
+        pid = int(_pidfile().read_text())
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip() == "wl-mirror"
+    except (OSError, ValueError):
+        return False
+
+
+def stop_mirror():
+    if mirror_running():
+        os.kill(int(_pidfile().read_text()), signal.SIGTERM)
+    _pidfile().unlink(missing_ok=True)
+
+
+def logical_width(name):
+    for output in get_outputs():
+        if output["name"] == name:
+            return output["rect"]["width"]
+    return 0
+
+
+def apply_layout(layout):
+    internal, external = roles(get_outputs())
+    if external is None and layout != "laptop":
+        notify("Displays", "No external display detected")
+        return False
+    stop_mirror()
+    # Both screens must be on before their logical widths can be read.
+    if external and layout in ("extend-right", "extend-left"):
+        sway(f"output {internal} enable")
+        sway(f"output {external} enable")
+    int_w = logical_width(internal)
+    ext_w = logical_width(external) if external else 0
+    commands = layout_commands(layout, internal, external, int_w, ext_w)
+    if not all(sway(command) for command in commands):
+        notify("Displays", f"Could not apply layout {layout}")
+        return False
+    if layout == "mirror":
+        # Sway has no native mirroring: wl-mirror shows the laptop screen fullscreen
+        # on the external one.
+        proc = subprocess.Popen(["wl-mirror", "--fullscreen-output", external, "--fullscreen", internal],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        _pidfile().write_text(str(proc.pid))
+    notify("Display", LAYOUT_LABELS[layout])
+    return True
+
+
+def resolution_menu():
+    _, external = roles(get_outputs())
+    if external is None:
+        notify("Displays", "No external display detected")
+        return
+    output = next(o for o in get_outputs() if o["name"] == external)
+    rows = []
+    for mode in output["modes"]:
+        row = f'{mode["width"]}x{mode["height"]} @ {mode["refresh"] / 1000:.3f} Hz'
+        if row not in rows:
+            rows.append(row)
+    choice = rofi(f"{external} resolution", rows)
+    if not choice:
+        return
+    size, rate = choice.split(" @ ")
+    if not sway(f'output {external} mode {size}@{rate.split()[0]}Hz'):
+        notify("Displays", f"Could not set {choice} on {external}")
+
+
+def scale_menu():
+    outputs = [o for o in get_outputs() if o["active"]]
+    if len(outputs) == 1:
+        name = outputs[0]["name"]
+    else:
+        name = rofi("Scale which screen", [o["name"] for o in outputs])
+    if not name:
+        return
+    choice = rofi(f"{name} scale", SCALES)
+    if choice:
+        sway(f"output {name} scale {choice}")
+        notify("Display scale", f"{name}: {choice}. Save a profile to keep it.")
+
+
+def _reload_kanshi():
+    subprocess.run(["kanshictl", "reload"], capture_output=True, check=False)
+
+
+def save_profile():
+    name = safe_name(rofi_text("Profile name") or "")
+    if not name:
+        return
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    (PROFILES_DIR / name).write_text(render_profile(name, get_outputs()))
+    _reload_kanshi()
+    notify("Display profile saved", name)
+
+
+def known_profiles():
+    names = []
+    files = [KANSHI_DIR / "config"] + sorted(PROFILES_DIR.glob("*"))
+    for path in files:
+        try:
+            names += profile_names(path.read_text())
+        except OSError:
+            pass
+    return names
+
+
+def load_profile():
+    choice = rofi("Load profile", known_profiles())
+    if choice:
+        ok = subprocess.run(["kanshictl", "switch", choice], capture_output=True).returncode == 0
+        notify("Display profile" if ok else "Could not load profile", choice)
+
+
+def menu():
+    internal, external = roles(get_outputs())
+    rows = {
+        "Extend right": lambda: apply_layout("extend-right"),
+        "Extend left": lambda: apply_layout("extend-left"),
+        "Mirror": lambda: apply_layout("mirror"),
+        "External only": lambda: apply_layout("external"),
+        "Laptop only": lambda: apply_layout("laptop"),
+        "External resolution / refresh...": resolution_menu,
+        "UI scale (per screen)...": scale_menu,
+        "Save layout as profile...": save_profile,
+        "Load saved profile...": load_profile,
+        "Open display settings (wdisplays)": lambda: subprocess.Popen(
+            ["wdisplays"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True),
+    }
+    status = subprocess.run(["kanshictl", "status"], capture_output=True, text=True).stdout
+    profile = parse_kanshi_status(status) or "none"
+    choice = rofi("Displays", list(rows),
+                  f"Laptop: {internal or 'none'}   External: {external or 'not connected'}   Profile: {profile}")
+    if choice in rows:
+        rows[choice]()
+
+
+def main(argv):
+    if not argv:
+        menu()
+        return 0
+    action = argv[0]
+    if action == "cycle":
+        outputs = get_outputs()
+        if roles(outputs)[1] is None:
+            notify("Displays", "No external display detected")
+            return 0
+        layout = next_layout(current_layout(outputs, mirror_running()))
+        if not apply_layout(layout):
+            return 1
+        print(layout)  # display-toggle switches the audio output from this
+        return 0
+    if action in ("extend-right", "extend-left", "mirror", "external", "laptop"):
+        return 0 if apply_layout(action) else 1
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

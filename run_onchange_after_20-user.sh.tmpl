@@ -3,7 +3,7 @@
 # Re-runs when these change:
 #   drive-sync units {{ include "dot_config/systemd/user/drive-sync.timer" | sha256sum | trunc 16 }} {{ include "dot_config/systemd/user/drive-sync.service.tmpl" | sha256sum | trunc 16 }}
 #   mimeapps.list    {{ include "dot_config/mimeapps.list" | sha256sum | trunc 16 }}
-#   i3 config        {{ include "dot_config/i3/config.tmpl" | sha256sum | trunc 16 }}
+#   sway config      {{ include "dot_config/sway/config.tmpl" | sha256sum | trunc 16 }}
 #   battery units    {{ include "dot_config/systemd/user/battery-alert.timer" | sha256sum | trunc 16 }} {{ include "dot_config/systemd/user/battery-health.timer" | sha256sum | trunc 16 }}
 set -uo pipefail
 
@@ -20,7 +20,6 @@ if systemctl --user show-environment >/dev/null 2>&1; then
     else
         notes+=("Drive sync is off: run 'rclone config', then copy ~/.config/drive-sync/remotes.conf.example to remotes.conf and run 'chezmoi apply'")
     fi
-    systemctl --user enable i3-graphical-session.service >/dev/null 2>&1 || true
 {{- if .hasBattery }}
     systemctl --user enable --now battery-alert.timer battery-health.timer >/dev/null 2>&1 || true
 {{- end }}
@@ -49,15 +48,10 @@ if has xdg-mime && [ "$(xdg-mime query default inode/directory 2>/dev/null)" != 
     xdg-mime default thunar.desktop inode/directory
 fi
 
-# ---------------------------------------------------------------- displays
-if [ -z "$(find "$HOME/.config/autorandr" -mindepth 2 -maxdepth 2 -name config 2>/dev/null)" ]; then
-    notes+=("No autorandr profiles yet: arrange your screens (Super+p or arandr), then 'autorandr --save <name>'")
-fi
-
 # ---------------------------------------------------------------- reload the running desktop
-if [ -n "${DISPLAY:-}" ] && pgrep -x i3 >/dev/null 2>&1; then
-    i3-msg reload >/dev/null 2>&1 && say "i3 reloaded"
-    [ -x "$HOME/.config/polybar/launch.sh" ] && "$HOME/.config/polybar/launch.sh" >/dev/null 2>&1 &
+# Sway shows an error bar if a config with errors is loaded, so check first.
+if [ -n "${SWAYSOCK:-}" ] && sway -C -c "$HOME/.config/sway/config" >/dev/null 2>&1; then
+    swaymsg reload >/dev/null 2>&1 && say "sway reloaded"
 fi
 
 if [ "${#notes[@]}" -gt 0 ]; then

@@ -1,0 +1,32 @@
+# Monitor profiles (replaces autorandr). kanshi uses the first profile that matches
+# the connected screens, so profiles saved from the Displays menu come first.
+# The placeholder file in profiles.d keeps this include valid when none are saved.
+include ~/.config/kanshi/profiles.d/*
+
+# Was autorandr "mobile": laptop only.
+profile mobile {
+    output eDP-1 enable scale 1.25 position 0,0
+    exec ~/.config/sway/scripts/profile-notify mobile
+}
+
+# Was autorandr "desk-benq": laptop on the left, 4K BenQ on HDMI at 60 Hz on the right.
+# Matched by the model and serial in the monitor's EDID, so another screen on this port
+# (a TV) falls through to "docked". The make is a wildcard because it comes from a lookup
+# table that can change. If this ever fails to match, "docked" gives the same layout.
+# The position is the laptop's logical width, 1920 / 1.25 = 1536.
+#
+# To use scale 1.5: set "scale 1.5" and "position 1280,0" (1920 / 1.5) on the external
+# line, set "scale 1.5" on each eDP-1 line, and change "output eDP-1 scale" in the Sway
+# config. To scale only the external screen, change just its "scale".
+profile desk-benq {
+    output eDP-1 enable scale 1.25 position 0,0
+    output "* BenQ MA320U *" enable mode 3840x2160@60Hz scale 1.25 position 1536,0
+    exec ~/.config/sway/scripts/profile-notify desk-benq
+}
+
+# Any other external screen, at its preferred mode.
+profile docked {
+    output eDP-1 enable scale 1.25 position 0,0
+    output * enable scale 1.25 position 1536,0
+    exec ~/.config/sway/scripts/profile-notify docked
+}

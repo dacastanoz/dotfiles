@@ -28,12 +28,10 @@ Recovery	Alt+SysRq  R E I S U B	Frozen desktop, kernel alive: hold Alt+SysRq, ty
 Packages	paru -Syu	Update system and AUR packages
 Packages	brew update && brew upgrade	Update Homebrew tools (fish, tmux, nvim, lazygit, gentle-ai...)
 Packages	nvim --headless "+Lazy! sync" +qa	Update Neovim plugins (back up lazy-lock.json first)	copy
-Displays	autorandr --current	Name of the display profile in use
-Displays	autorandr --change	Re-apply the matching display profile
-{{- range (glob (joinPath .chezmoi.homeDir ".config/autorandr/*/config")) }}
-Displays	autorandr --load {{ . | dir | base }}	Load the saved display profile "{{ . | dir | base }}"
-{{- end }}
-Displays	autorandr --save <name>	Save the current layout as a profile	copy
+Displays	kanshictl switch desk-benq	Sway: laptop + BenQ 4K on the right
+Displays	kanshictl switch mobile	Sway: laptop screen only
+Displays	kanshictl reload	Sway: re-read display profiles
+Displays	swaymsg -t get_outputs	Sway: list screens, modes and scale
 tmux	tmux ls	List tmux sessions
 tmux	tmux kill-server	Stop every tmux session (needed after a tmux upgrade)
 Gentle AI	gentle-ai version	Installed gentle-ai version

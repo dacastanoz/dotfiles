@@ -1,0 +1,38 @@
+// Two bars with the same modules, as with Polybar: the laptop panel carries the tray,
+// other screens do not. Under "External only" no screen has a tray, because Waybar
+// cannot move it. Remove the last entry of the "secondary" list only if you want a
+// bar to differ further.
+[
+    {
+        "name": "primary",
+        "include": "~/.config/waybar/modules.jsonc",
+        "output": "eDP-1",
+        "layer": "top",
+        "position": "top",
+        "height": 24,
+        "spacing": 0,
+        "modules-left": ["custom/launcher", "sway/workspaces", "sway/mode", "cpu", "custom/temperature", "memory"],
+        "modules-center": ["clock"],
+        "modules-right": [
+            "custom/bg-apps", "custom/bar-errors", "custom/updates", "custom/drive-sync", "custom/airplane",
+            "pulseaudio", "network", "custom/bluetooth", "battery", "custom/battery-care",
+            "custom/shortcuts", "custom/control", "custom/power", "tray"
+        ]
+    },
+    {
+        "name": "secondary",
+        "include": "~/.config/waybar/modules.jsonc",
+        "output": "!eDP-1",
+        "layer": "top",
+        "position": "top",
+        "height": 24,
+        "spacing": 0,
+        "modules-left": ["custom/launcher", "sway/workspaces", "sway/mode", "cpu", "custom/temperature", "memory"],
+        "modules-center": ["clock"],
+        "modules-right": [
+            "custom/bg-apps", "custom/bar-errors", "custom/updates", "custom/drive-sync", "custom/airplane",
+            "pulseaudio", "network", "custom/bluetooth", "battery", "custom/battery-care",
+            "custom/shortcuts", "custom/control", "custom/power"
+        ]
+    }
+]

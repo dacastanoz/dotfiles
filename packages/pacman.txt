@@ -1,32 +1,16 @@
-# Official / CachyOS repository packages for the i3 desktop (one per line, # comments allowed).
+# Official / CachyOS repository packages for the Sway desktop (one per line, # comments allowed).
 # Hardware-specific packages (Bluetooth, ryzenadj, battery drivers) are added by
 # run_once_before_00-packages.sh only on machines that need them.
 
-# Window manager, bar, launcher, notifications, compositor, terminal
-i3-wm
-i3lock
-polybar
+# Launcher, notifications, terminal, media and brightness keys
 rofi
 dunst
 libnotify
-picom
 ghostty
 dex
-xidlehook-placeholder-see-aur
-feh
-maim
-xclip
-xob
 pamixer
 brightnessctl
 playerctl
-xorg-xrandr
-xorg-xset
-xorg-xdpyinfo
-
-# Displays
-autorandr
-arandr
 
 # Network, audio, power
 network-manager-applet
@@ -85,3 +69,25 @@ sd
 jq
 fzf
 shellcheck
+
+# Sway desktop: compositor, bar, lock, idle, screenshots, clipboard, displays, OSD
+sway
+swaybg
+swayidle
+swaylock
+waybar
+grim
+slurp
+wl-clipboard
+kanshi
+xdg-desktop-portal-wlr
+xorg-xwayland
+python-evdev
+wob
+wdisplays
+imv
+wl-mirror
+xdg-desktop-portal-gtk
+libappindicator
+alsa-utils
+ttf-hack

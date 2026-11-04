@@ -1,0 +1,4 @@
+#!/bin/sh
+# Waybar with the session environment from the Sway config ($env), so apps launched
+# from the bar get it as well.
+exec env ELECTRON_OZONE_PLATFORM_HINT=auto MOZ_ENABLE_WAYLAND=1 XDG_CURRENT_DESKTOP=sway waybar "$@"

@@ -1,12 +1,10 @@
 [Unit]
-Description=Bind graphical-session.target for i3
+Description=Bind graphical-session.target for Sway
 BindsTo=graphical-session.target
 Wants=graphical-session-pre.target
 After=graphical-session-pre.target
 
+# Started and stopped by ~/.config/sway/scripts/session-env, so it has no [Install].
 [Service]
 Type=simple
 ExecStart=/usr/bin/sleep infinity
-
-[Install]
-WantedBy=default.target

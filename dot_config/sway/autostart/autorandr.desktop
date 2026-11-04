@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=autorandr
+Comment=Disabled under Sway: kanshi handles monitors
+Hidden=true

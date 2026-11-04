@@ -190,9 +190,11 @@ else
     skipped+=("Bluetooth: no adapter")
 fi
 
-# ---------------------------------------------------------------- displays
-if has autorandr; then
-    install_sys etc/systemd/system/autorandr.service.d/override.conf || true
+# ---------------------------------------------------------------- pointer devices
+# Lets cursor-shake read mice and touchpads at the active seat. Keyboards are not included.
+if install_sys etc/udev/rules.d/70-pointer-uaccess.rules; then
+    sudo udevadm control --reload || true
+    sudo udevadm trigger --subsystem-match=input || true
 fi
 
 # ---------------------------------------------------------------- kernel command line (limine)
@@ -235,7 +237,6 @@ if [ "$IS_AMD_LAPTOP" = true ] && has ryzenadj; then
 fi
 [ "$watchdog_ok" = true ] && { enable_unit watchdog-suspend.service || true; }
 [ "$HAS_BATTERY" = true ] && { enable_unit battery-care.service || true; }
-has autorandr && { enable_unit autorandr.service || true; }
 # Boot speed: nothing here needs to wait for the network at boot.
 if systemctl is-enabled --quiet NetworkManager-wait-online.service 2>/dev/null; then
     sudo systemctl disable NetworkManager-wait-online.service >/dev/null 2>&1 && enabled+=("-NetworkManager-wait-online (disabled)")

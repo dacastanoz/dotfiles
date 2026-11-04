@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Start the wob volume/brightness OSD once. Idempotent: safe on every Sway reload,
+# and restarts wob if it died. Writers send values to $XDG_RUNTIME_DIR/wob.pipe.
+pipe=${XDG_RUNTIME_DIR:?}/wob.pipe
+[[ -p $pipe ]] || { rm -f "$pipe"; mkfifo "$pipe"; }
+pgrep -u "$UID" -x wob >/dev/null && exit 0
+pkill -u "$UID" -f "tail -f $pipe" 2>/dev/null
+setsid -f sh -c "tail -f '$pipe' | wob" >/dev/null 2>&1

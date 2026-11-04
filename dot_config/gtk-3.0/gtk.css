@@ -1,0 +1,21 @@
+/* Thunar: readable selected items in the icon and compact views.
+ *
+ * The cachyos-nord theme (gtk-3.20/dist/gtk.css, "Generic views") sets
+ * `.view, iconview { color: #47add6 }` with no :selected color for the icon view,
+ * and Thunar paints the selection from the theme's #47add6 at 50% alpha, so a
+ * selected name is #47add6 on a background made from #47add6.
+ *
+ * The selection background is painted by Thunar and did not respond to CSS, so
+ * only the text changes. `.standard-view` is the class Thunar puts on its file
+ * views, so no other GTK application is affected.
+ *
+ * Measured on screen: Nord #eceff4 on the painted #2c617b is 5.87:1.
+ */
+.standard-view .view:selected,
+.standard-view .view:selected:focus,
+.standard-view .view:selected:backdrop,
+.standard-view iconview:selected,
+.standard-view iconview:selected:focus,
+.standard-view iconview:selected:backdrop {
+    color: #eceff4;
+}

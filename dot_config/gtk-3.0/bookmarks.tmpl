@@ -1,3 +1,8 @@
+{{- /* Personal bookmarks stay out of the repo, in this machine-local file (if any). */ -}}
+{{- $local := joinPath .chezmoi.homeDir ".config/gtk-3.0/bookmarks.local" -}}
+{{- if stat $local -}}
+{{ include $local }}
+{{- end -}}
 {{- range (includeTemplate "drive-remotes" . | splitList "\n") -}}
 {{- if ne . "" -}}
 {{- $f := splitList "|" . -}}

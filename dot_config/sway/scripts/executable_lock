@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Lock the screen. Replaces `i3lock --blur 5`: stock swaylock cannot blur, so it
+# shows the wallpaper.
+exec swaylock -f -s fill -i "$HOME/.config/sway/wallpaper.png" -c 2e3440

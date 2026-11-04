@@ -1,0 +1,7 @@
+#!/bin/sh
+# Announce a kanshi profile, only when it changes. kanshi runs this on every apply,
+# and every Sway reload makes it apply again.
+state=${XDG_RUNTIME_DIR:?}/kanshi-last-profile
+[ "$(cat "$state" 2>/dev/null)" = "$1" ] && exit 0
+printf '%s\n' "$1" >"$state"
+exec notify-send -a Displays -i video-display "Display profile" "$1"

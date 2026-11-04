@@ -30,20 +30,29 @@
 set -u
 
 DATA_DIR=${SHORTCUTS_DATA_DIR:-$HOME/.config/shortcuts-menu}
-I3_CONFIG=${SHORTCUTS_I3_CONFIG:-$HOME/.config/i3/config}
+# The window manager in use: its config, command tool and name in the menu.
+if [ -n "${SWAYSOCK:-}" ]; then
+    I3_CONFIG=${SHORTCUTS_I3_CONFIG:-$HOME/.config/sway/config}
+    WM_MSG=swaymsg
+    WM_NAME=sway
+else
+    I3_CONFIG=${SHORTCUTS_I3_CONFIG:-$HOME/.config/i3/config}
+    WM_MSG=i3-msg
+    WM_NAME=i3
+fi
 TMUX_CONF=${SHORTCUTS_TMUX_CONF:-$HOME/.tmux.conf}
 GHOSTTY_CONFIG=$HOME/.config/ghostty/config
 NVIM_LUA=$HOME/.config/nvim/lua
 YAZI_KEYMAP=$HOME/.config/yazi/keymap.toml
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/shortcuts-menu
-CACHE=$CACHE_DIR/rows.tsv
+CACHE=$CACHE_DIR/rows-$WM_NAME.tsv
 POPUP_CLASS=dev.gentleman.popup
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 # Categories in display order: id|icon|color|title
 CATS=(
-    "i3-apps|"$'\U000F003B'"|#d08770|i3 · apps & launchers"
-    "i3-windows|"$'\U000F056E'"|#88c0d0|i3 · windows & workspaces"
+    "i3-apps|"$'\U000F003B'"|#d08770|$WM_NAME · apps & launchers"
+    "i3-windows|"$'\U000F056E'"|#88c0d0|$WM_NAME · windows & workspaces"
     "system|"$'\U000F0493'"|#81a1c1|System & connections"
     "media|"$'\U000F075A'"|#b48ead|Media & screenshots"
     "monitoring|"$'\U000F050F'"|#bf616a|Monitoring"
@@ -66,7 +75,7 @@ cat_ids() { local c; for c in "${CATS[@]}"; do printf '%s\n' "${c%%|*}"; done; }
 # ============================================================ i3
 i3_rows() {
     [ -r "$I3_CONFIG" ] || return 0
-    awk '
+    awk -v wm="$WM_NAME" '
     function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
 
     function pretty_part(p,   n) {
@@ -120,7 +129,7 @@ i3_rows() {
         if (c ~ /control-center radio-status/) return "Show airplane / radio status"
         if (c ~ /control-center/) return "Control center"
         if (c ~ /display-toggle/) return "Quick display cycle"
-        if (c ~ /i3lock/) return "Lock screen"
+        if (c ~ /i3lock|scripts\/lock/) return "Lock screen"
         if (c ~ /thunar/) return "File manager (Thunar)"
         if (c ~ /blueman-manager/) return "Bluetooth manager"
         if (c ~ /gnome-calculator/) return "Calculator"
@@ -132,11 +141,11 @@ i3_rows() {
         if (c ~ /amixer .*toggle/) return "Mute / unmute"
         if (c ~ /brightnessctl set \+/) return "Brightness up"
         if (c ~ /brightnessctl set [0-9]+%-/) return "Brightness down"
-        if (c ~ /maim -s/) return "Screenshot area to clipboard"
-        if (c ~ /maim /) return "Screenshot full screen to file"
+        if (c ~ /maim -s|grim -g/) return "Screenshot area to clipboard"
+        if (c ~ /maim |grim /) return "Screenshot full screen to file"
         if (c ~ /dunstctl close-all/) return "Close all notifications"
         if (c ~ /dunstctl history-pop/) return "Show last notification again"
-        if (c ~ /setxkbmap/) return "Switch keyboard layout"
+        if (c ~ /setxkbmap|xkb_switch_layout/) return "Switch keyboard layout"
         if (c ~ /tmux new-session -A -s main/) return "Terminal attached to tmux session main"
         if (c ~ /lazygit/) return "lazygit popup"
         if (c ~ /yazi/) return "yazi popup"
@@ -155,9 +164,9 @@ i3_rows() {
         if (c == "floating toggle") return "Floating / tiling (toggle)"
         if (c == "focus mode_toggle") return "Switch focus between tiling and floating windows"
         if (c == "focus parent") return "Focus parent container"
-        if (c == "reload") return "Reload i3 config"
+        if (c == "reload") return "Reload " wm " config"
         if (c == "restart") return "Restart i3 in place (keeps windows)"
-        if (c == "exit") return "Exit i3 (log out)"
+        if (c == "exit") return "Exit " wm " (log out)"
         if (c ~ /^mode "?resize"?$/) return "Resize mode (see the resize mode rows)"
         if (c ~ /^resize shrink width/) return "Shrink width"
         if (c ~ /^resize grow width/) return "Grow width"
@@ -168,11 +177,11 @@ i3_rows() {
     }
 
     function category(c, k) {
-        if (k ~ /XF86Audio|XF86MonBrightness|Print/ || c ~ /playerctl|pamixer|amixer|brightnessctl|maim/)
+        if (k ~ /XF86Audio|XF86MonBrightness|Print/ || c ~ /playerctl|pamixer|amixer|brightnessctl|maim|grim/)
             return "media"
         if (c ~ /lazygit|yazi|nvim-project|tmux/) return "dev"
         if (c ~ /temperature\.sh|btop/) return "monitoring"
-        if (c ~ /control-center|display-toggle|blueman|rofi-powermenu|i3lock|dunstctl|setxkbmap/)
+        if (c ~ /control-center|display-toggle|blueman|rofi-powermenu|i3lock|scripts\/lock|dunstctl|setxkbmap|xkb_switch_layout/)
             return "system"
         if (c ~ /^exec /) return "i3-apps"
         return "i3-windows"
@@ -196,8 +205,8 @@ i3_rows() {
             mode = line; sub(/^mode[ \t]+/, "", mode); sub(/[ \t]*\{$/, "", mode); gsub(/"/, "", mode)
         } else if (mode != "" && line == "}") {
             mode = ""
-        } else if (line ~ /^bindsym[ \t]/) {
-            rest = line; sub(/^bindsym[ \t]+/, "", rest)
+        } else if (line ~ /^(bindsym|bindgesture)[ \t]/) {
+            rest = line; sub(/^(bindsym|bindgesture)[ \t]+/, "", rest)
             while (rest ~ /^--/) sub(/^--[^ \t]+[ \t]+/, "", rest)
             key = rest; sub(/[ \t].*$/, "", key)
             cmd = rest; sub(/^[^ \t]+[ \t]+/, "", cmd)
@@ -216,16 +225,16 @@ i3_rows() {
                 emit("i3-windows", mode " mode", pretty_key(key), desc, "copy", pretty_key(key))
             }
             # Repetitive bindings collapse into one summary row each.
-            else if (cmd ~ /^workspace number /) { if (!seen["ws"]++) emit("i3-windows", "i3", "Super+1..0", "Switch to workspace 1-10", "copy", "Super+1..0") }
-            else if (cmd ~ /^move container to workspace /) { if (!seen["mv"]++) emit("i3-windows", "i3", "Super+Shift+1..0", "Move window to workspace 1-10", "copy", "Super+Shift+1..0") }
-            else if (cmd ~ /^focus (left|right|up|down)$/) { if (!seen["fo"]++) emit("i3-windows", "i3", "Super+Arrows", "Focus window left / down / up / right", "copy", "Super+Arrows") }
-            else if (cmd ~ /^move (left|right|up|down)$/) { if (!seen["mw"]++) emit("i3-windows", "i3", "Super+Shift+Arrows", "Move window left / down / up / right", "copy", "Super+Shift+Arrows") }
-            else emit(category(cmd, key), "i3", pretty_key(key), desc, "i3", cmd)
+            else if (cmd ~ /^workspace number /) { if (!seen["ws"]++) emit("i3-windows", wm, "Super+1..0", "Switch to workspace 1-10", "copy", "Super+1..0") }
+            else if (cmd ~ /^move container to workspace /) { if (!seen["mv"]++) emit("i3-windows", wm, "Super+Shift+1..0", "Move window to workspace 1-10", "copy", "Super+Shift+1..0") }
+            else if (cmd ~ /^focus (left|right|up|down)$/) { if (!seen["fo"]++) emit("i3-windows", wm, "Super+Arrows", "Focus window left / down / up / right", "copy", "Super+Arrows") }
+            else if (cmd ~ /^move (left|right|up|down)$/) { if (!seen["mw"]++) emit("i3-windows", wm, "Super+Shift+Arrows", "Move window left / down / up / right", "copy", "Super+Shift+Arrows") }
+            else emit(category(cmd, key), wm, pretty_key(key), desc, "i3", cmd)
         }
         if (line != "") prev = line
     }
     END {
-        emit("i3-windows", "i3", "Super+drag", "Move a floating window with the mouse (right button resizes)", "copy", "Super+drag")
+        emit("i3-windows", wm, "Super+drag", "Move a floating window with the mouse (right button resizes)", "copy", "Super+drag")
     }' "$I3_CONFIG"
 }
 
@@ -636,16 +645,24 @@ run_row() { # run_row <kind> <action>
     local kind=$1 action=$2
     case "$kind" in
         i3)
-            i3-msg -q -- "$action" ;;
+            "$WM_MSG" -q -- "$action" ;;
         launch)
-            i3-msg -q -- "exec --no-startup-id $action" ;;
+            if [ "$WM_NAME" = i3 ]; then
+                i3-msg -q -- "exec --no-startup-id $action"
+            else
+                swaymsg -q -- "exec $action"
+            fi ;;
         term)
             setsid -f ghostty --class="$POPUP_CLASS" --window-width=0 --window-height=0 \
                 --title="$action" \
                 -e fish -c "$action; echo; read -P 'Press Enter to close ' -l _answer" \
                 >/dev/null 2>&1 ;;
         copy)
-            printf '%s' "$action" | xclip -selection clipboard
+            if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+                printf '%s' "$action" | wl-copy
+            else
+                printf '%s' "$action" | xclip -selection clipboard
+            fi
             notify-send -a "Shortcuts" -i edit-copy -t 3000 "Copied to clipboard" "$action" 2>/dev/null || true ;;
     esac
 }

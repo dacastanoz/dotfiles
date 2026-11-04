@@ -1,0 +1,69 @@
+#!/usr/bin/python3
+"""Run a command written for Polybar and show its output in a Waybar custom module.
+
+    pango-filter <command> [args...]
+
+Translates the Polybar %{F#rrggbb}...%{F-} color tags in each output line to Pango
+markup, removes other Polybar tags, and escapes everything else. Lines are forwarded
+as they arrive, so it also works for commands that keep running.
+"""
+import html
+import re
+import signal
+import subprocess
+import sys
+
+TAG = re.compile(r"%\{([^}]*)\}")
+
+
+def convert(line):
+    out = []
+    pos = 0
+    open_span = False
+    for match in TAG.finditer(line):
+        out.append(html.escape(line[pos:match.start()], quote=False))
+        pos = match.end()
+        tag = match.group(1)
+        if tag.startswith("F#"):
+            if open_span:
+                out.append("</span>")
+            out.append(f'<span color="{html.escape(tag[1:])}">')
+            open_span = True
+        elif tag == "F-" and open_span:
+            out.append("</span>")
+            open_span = False
+    out.append(html.escape(line[pos:], quote=False))
+    if open_span:
+        out.append("</span>")
+    return "".join(out)
+
+
+def main(argv):
+    if not argv:
+        print("usage: pango-filter <command> [args...]", file=sys.stderr)
+        return 2
+
+    # USR1/USR2 wake the wrapped tail scripts, matched with pkill -f, which also
+    # matches this process. These must be handlers, not SIG_IGN: an ignored signal
+    # stays ignored across exec and the bash script could no longer trap it.
+    for signum in (signal.SIGUSR1, signal.SIGUSR2):
+        signal.signal(signum, lambda *_: None)
+
+    child = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+
+    def stop(*_):
+        child.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    try:
+        for line in child.stdout:
+            print(convert(line.rstrip("\n")), flush=True)
+    except BrokenPipeError:
+        child.terminate()
+    return child.wait()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

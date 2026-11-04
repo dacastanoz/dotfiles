@@ -2,6 +2,32 @@
 # Display toggle script - cycles through modes like Windows+P
 # Modes: laptop-only → extend-right → mirror → tv-only → laptop-only
 
+switch_audio_hdmi() {
+    HDMI_CARD="alsa_card.pci-0000_03_00.1"
+    pactl set-card-profile "$HDMI_CARD" HiFi 2>/dev/null
+    sleep 0.3
+    HDMI_SINK=$(pactl list sinks short | grep "pci-0000_03_00.1" | awk '{print $2}' | head -1)
+    [ -n "$HDMI_SINK" ] && pactl set-default-sink "$HDMI_SINK"
+}
+
+switch_audio_speaker() {
+    HDMI_CARD="alsa_card.pci-0000_03_00.1"
+    pactl set-card-profile "$HDMI_CARD" off 2>/dev/null
+    SPEAKER_SINK=$(pactl list sinks short | grep "pci-0000_03_00.6" | awk '{print $2}' | head -1)
+    [ -n "$SPEAKER_SINK" ] && pactl set-default-sink "$SPEAKER_SINK"
+}
+
+if [ -n "${SWAYSOCK:-}" ]; then
+    # Sway: the layout cycle is in the displays script, which reports the new layout.
+    layout=$("$HOME/.config/sway/scripts/displays" cycle) || exit 0
+    case "$layout" in
+        laptop) switch_audio_speaker ;;
+        "") ;;
+        *) switch_audio_hdmi ;;
+    esac
+    exit 0
+fi
+
 # Laptop panel name is detected (eDP, eDP-1, LVDS-1, ...) instead of hardcoded.
 INTERNAL=$(xrandr --query | awk '/ connected/ && $1 ~ /^(eDP|LVDS|DSI)/ {print $1; exit}')
 INTERNAL=${INTERNAL:-eDP}
@@ -15,29 +41,6 @@ fi
 # Detect current mode
 internal_active=$(xrandr | grep "^$INTERNAL " | grep -oP '\d+x\d+\+\d+\+\d+')
 external_active=$(xrandr | grep "^$EXTERNAL " | grep -oP '\d+x\d+\+\d+\+\d+')
-
-# Audio card that carries HDMI/DisplayPort outputs (detected, e.g. alsa_card.pci-0000_03_00.1).
-hdmi_card() {
-    pactl list cards 2>/dev/null | awk '
-        /^[[:space:]]*Name: /{name=$2}
-        /hdmi-output|HDMI|DisplayPort/ && name {print name; exit}'
-}
-
-switch_audio_hdmi() {
-    HDMI_CARD=$(hdmi_card)
-    [ -n "$HDMI_CARD" ] || return 0
-    pactl set-card-profile "$HDMI_CARD" HiFi 2>/dev/null
-    sleep 0.3
-    HDMI_SINK=$(pactl list sinks short | grep -i "hdmi\|displayport" | awk '{print $2}' | head -1)
-    [ -n "$HDMI_SINK" ] && pactl set-default-sink "$HDMI_SINK"
-}
-
-switch_audio_speaker() {
-    HDMI_CARD=$(hdmi_card)
-    [ -n "$HDMI_CARD" ] && pactl set-card-profile "$HDMI_CARD" off 2>/dev/null
-    SPEAKER_SINK=$(pactl list sinks short | awk '$2 ~ /^alsa_output\./ && tolower($2) !~ /hdmi|displayport/ {print $2; exit}')
-    [ -n "$SPEAKER_SINK" ] && pactl set-default-sink "$SPEAKER_SINK"
-}
 
 if [ -z "$external_active" ]; then
     # Mode: laptop only → extend right

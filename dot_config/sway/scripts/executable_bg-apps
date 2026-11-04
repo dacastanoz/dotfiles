@@ -1,0 +1,357 @@
+#!/usr/bin/python3
+"""List apps still running with no window, and stop them on request.
+
+    bg-apps --waybar   one line of JSON for a Waybar custom module
+    bg-apps --menu     rofi picker; choosing an entry asks, then sends SIGTERM
+    bg-apps --list     plain text list, for the terminal
+
+Standard library only. To change what counts as a background app, edit the
+sets below.
+"""
+import argparse
+import html
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+# Session services: never listed, and neither is anything they start.
+INFRASTRUCTURE = {
+    "at-spi-bus-launcher", "at-spi2-registryd", "bg-apps", "biq", "blueman-applet",
+    "blueman-tray", "limine-snapper-notify", "tail", "wl-copy", "wl-paste",
+    "chrome_crashpad_handler", "cursor-shake", "dbus-broker", "dbus-broker-launch",
+    "dbus-daemon", "dconf-service", "dunst", "fcitx5", "gnome-keyring-daemon",
+    "gpg-agent", "ibus-daemon", "kanshi", "nm-applet", "obexd", "pipewire",
+    "pipewire-pulse", "pango-filter", "polkit-gnome-authentication-agent-1",
+    "scdaemon", "session-env", "ssh-agent", "swaybar", "swaybg", "swayidle",
+    "swaylock", "tumblerd", "udiskie", "waybar", "wireplumber", "wob",
+    "xdg-desktop-portal", "xdg-desktop-portal-gtk", "xdg-desktop-portal-wlr",
+    "xdg-document-portal", "xdg-permission-store", "xfconfd", "Xwayland",
+}
+# Same as above, matched by prefix.
+INFRASTRUCTURE_PREFIXES = ("gvfs",)
+# Never listed, but what they start is still a candidate.
+SESSION_ROOTS = {"systemd", "(sd-pam)", "sway", "ly-dm", "ly", "login", "init", "sudo", "su", "sshd-session"}
+# Skipped in favour of what they run.
+WRAPPERS = {"sh", "bash", "dash", "zsh", "fish", "env", "setsid", "nohup", "timeout", "sleep"}
+# Shown by the script they run rather than by the interpreter name.
+INTERPRETERS = {"python", "python3", "node", "bun", "deno", "ruby", "perl"}
+# Ignore anything younger than this, so short-lived helpers do not flicker in the bar.
+MIN_AGE_SECONDS = 5
+ICON = "\U000F0614"  # nf-md-layers
+
+
+@dataclass(frozen=True)
+class Proc:
+    pid: int
+    ppid: int
+    uid: int
+    comm: str
+    argv: list
+    tty: int
+    start: float
+    rss_kb: int
+    state: str = "S"
+    cgroup: str = ""
+
+    __hash__ = None
+
+
+def basename(path):
+    return path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def display_name(proc):
+    if not proc.argv:
+        return proc.comm
+    name = basename(proc.argv[0])
+    if name in INTERPRETERS or name.startswith("python3."):
+        for arg in proc.argv[1:]:
+            if not arg.startswith("-"):
+                return basename(arg)
+    return name or proc.comm
+
+
+def is_claude(proc):
+    """True for the Claude Code CLI, whose comm may just be its version number."""
+    if proc.comm == "claude":
+        return True
+    if not proc.argv:
+        return False
+    if basename(proc.argv[0]) == "claude" or "/claude/versions/" in proc.argv[0]:
+        return True
+    return any("claude-code" in arg for arg in proc.argv[1:2])
+
+
+def _is_user_service(proc):
+    """True for a systemd user service, except app-*.service, which is a launched app."""
+    unit = basename(proc.cgroup)
+    return "/user@" in proc.cgroup and unit.endswith(".service") and not unit.startswith("app-")
+
+
+def _is_infrastructure(proc):
+    names = {proc.comm}
+    if proc.argv:
+        names.add(basename(proc.argv[0]))
+        # A script run by a shell shows the shell as its command.
+        if basename(proc.argv[0]) in WRAPPERS and len(proc.argv) > 1:
+            names.add(basename(proc.argv[1]))
+    return (bool(names & INFRASTRUCTURE) or _is_user_service(proc)
+            or any(n.startswith(INFRASTRUCTURE_PREFIXES) for n in names))
+
+
+def _is_session_root(proc):
+    return proc.comm in SESSION_ROOTS or (bool(proc.argv) and basename(proc.argv[0]) in SESSION_ROOTS)
+
+
+def _is_wrapper(proc):
+    return proc.comm in WRAPPERS or (bool(proc.argv) and basename(proc.argv[0]) in WRAPPERS)
+
+
+def _ancestors(proc, by_pid):
+    seen = set()
+    current = by_pid.get(proc.ppid)
+    while current is not None and current.pid not in seen:
+        seen.add(current.pid)
+        yield current
+        current = by_pid.get(current.ppid)
+
+
+def _window_family(procs, by_pid, windows):
+    """Every PID that has a window, descends from one, or is an ancestor of one."""
+    family = set(windows)
+    for proc in procs:
+        if proc.pid in windows:
+            family.update(a.pid for a in _ancestors(proc, by_pid))
+        elif any(a.pid in windows for a in _ancestors(proc, by_pid)):
+            family.add(proc.pid)
+    return family
+
+
+def classify(procs, windows, uid, now):
+    """Return the background apps among procs. Pure: all input comes from arguments."""
+    by_pid = {p.pid: p for p in procs}
+    family = _window_family(procs, by_pid, windows)
+
+    def alive(p):
+        return p.uid == uid and p.state != "Z" and bool(p.argv)
+
+    def candidate(p):
+        return (alive(p) and p.pid not in family and not _is_session_root(p)
+                and not _is_wrapper(p) and not _is_infrastructure(p))
+
+    listed = []
+    for proc in procs:
+        if not alive(proc) or now - proc.start < MIN_AGE_SECONDS or proc.pid in family:
+            continue
+        if is_claude(proc) and proc.tty == 0:
+            listed.append(proc)
+            continue
+        if not candidate(proc):
+            continue
+        ancestors = list(_ancestors(proc, by_pid))
+        if any(_is_infrastructure(a) or candidate(a) for a in ancestors):
+            continue
+        listed.append(proc)
+    return listed
+
+
+def format_age(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def format_mem(kb):
+    if kb < 1024:
+        return f"{kb} KiB"
+    if kb < 1024 * 1024:
+        return f"{kb // 1024} MiB"
+    return f"{kb / (1024 * 1024):.1f} GiB"
+
+
+def describe(proc, now):
+    return (f"{display_name(proc)}  PID {proc.pid}  {format_age(now - proc.start)}"
+            f"  {format_mem(proc.rss_kb)}")
+
+
+def waybar_json(listed, now):
+    count = len(listed)
+    if count == 0:
+        return json.dumps({"text": "", "count": 0, "tooltip": "", "class": "empty"})
+    lines = "\n".join(html.escape(describe(p, now), quote=False) for p in listed)
+    return json.dumps({"text": f"{ICON} {count}", "count": count, "class": "has-apps",
+                       "tooltip": f"Running with no window:\n{lines}"}, ensure_ascii=False)
+
+
+def window_pids(node):
+    """PIDs owning a window in a `swaymsg -t get_tree` document."""
+    found = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.get("type") in ("con", "floating_con") and current.get("pid"):
+            found.add(current["pid"])
+        stack.extend(current.get("nodes", []))
+        stack.extend(current.get("floating_nodes", []))
+    return found
+
+
+def terminate(pid, start, uid, owner_of, start_of, send=os.kill):
+    """SIGTERM pid, only if it is still the same process and still owned by uid."""
+    if owner_of(pid) != uid or start_of(pid) != start:
+        return False
+    send(pid, signal.SIGTERM)
+    return True
+
+
+def parse_stat(line):
+    """Parse /proc/<pid>/stat. comm may contain spaces and parentheses."""
+    left, right = line.find("("), line.rfind(")")
+    fields = line[right + 2:].split()
+    return {"comm": line[left + 1:right], "state": fields[0], "ppid": int(fields[1]),
+            "tty": int(fields[4]), "starttime": int(fields[19])}
+
+
+# ---------------------------------------------------------------- system access
+def _boot_time():
+    with open("/proc/stat") as fh:
+        for line in fh:
+            if line.startswith("btime "):
+                return int(line.split()[1])
+    return 0
+
+
+def _read_proc(pid, boot, ticks, page_kb):
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+        with open(f"/proc/{pid}/stat") as fh:
+            stat = parse_stat(fh.read())
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+        with open(f"/proc/{pid}/statm") as fh:
+            rss = int(fh.read().split()[1]) * page_kb
+        with open(f"/proc/{pid}/cgroup") as fh:
+            cgroup = fh.read().strip().rsplit(":", 1)[-1]
+    except (OSError, ValueError, IndexError):
+        return None
+    return Proc(pid=pid, ppid=stat["ppid"], uid=uid, comm=stat["comm"], argv=argv, tty=stat["tty"],
+                start=boot + stat["starttime"] / ticks, rss_kb=rss, state=stat["state"], cgroup=cgroup)
+
+
+def read_procs():
+    boot = _boot_time()
+    ticks = os.sysconf("SC_CLK_TCK")
+    page_kb = os.sysconf("SC_PAGE_SIZE") // 1024
+    pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+    return [p for p in (_read_proc(pid, boot, ticks, page_kb) for pid in pids) if p]
+
+
+def read_windows():
+    """Window PIDs, or None when Sway cannot be asked (then nothing can be classified)."""
+    try:
+        out = subprocess.run(["swaymsg", "-t", "get_tree", "-r"], capture_output=True, text=True,
+                             timeout=3, check=True).stdout
+        return window_pids(json.loads(out))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def current_list():
+    windows = read_windows()
+    if windows is None:
+        return None
+    own = os.getpid()
+    procs = [p for p in read_procs() if p.pid != own]
+    return classify(procs, windows, os.getuid(), time.time())
+
+
+def _owner_of(pid):
+    try:
+        return os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+
+
+def _start_of(pid):
+    proc = _read_proc(pid, _boot_time(), os.sysconf("SC_CLK_TCK"), 1)
+    return proc.start if proc else None
+
+
+def _rofi(prompt, rows, extra=()):
+    result = subprocess.run(["rofi", "-dmenu", "-i", "-no-custom", "-format", "i", "-p", prompt, *extra],
+                            input="\n".join(rows), capture_output=True, text=True)
+    text = result.stdout.strip()
+    return int(text) if result.returncode == 0 and text.isdigit() else None
+
+
+def _notify(summary, body=""):
+    subprocess.run(["notify-send", "-a", "Background apps", summary, body], check=False)
+
+
+def _refresh_bar():
+    subprocess.run(["pkill", "-RTMIN+8", "-u", str(os.getuid()), "-x", "waybar"], check=False)
+
+
+def run_menu():
+    listed = current_list()
+    if listed is None:
+        _notify("Background apps", "Could not ask Sway for its windows")
+        return 1
+    if not listed:
+        _notify("No background apps")
+        return 0
+    now = time.time()
+    choice = _rofi("Background apps", [describe(p, now) for p in listed])
+    if choice is None or choice >= len(listed):
+        return 0
+    proc = listed[choice]
+    name = display_name(proc)
+    if _rofi(f"Stop {name} (PID {proc.pid})?", ["No", "Yes"]) != 1:
+        return 0
+    if terminate(proc.pid, proc.start, os.getuid(), _owner_of, _start_of):
+        _notify(f"Sent SIGTERM to {name}", f"PID {proc.pid}")
+    else:
+        _notify(f"Did not stop {name}", "The process is gone or has changed")
+    time.sleep(0.3)
+    _refresh_bar()
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--waybar", action="store_true")
+    mode.add_argument("--menu", action="store_true")
+    mode.add_argument("--list", action="store_true")
+    args = parser.parse_args()
+
+    if args.menu:
+        return run_menu()
+    listed = current_list()
+    if args.waybar:
+        # Without Sway there is no way to tell what has a window: stay hidden, list nothing.
+        print(waybar_json(listed or [], time.time()), flush=True)
+        return 0
+    if listed is None:
+        print("bg-apps: cannot read the window tree from swaymsg", file=sys.stderr)
+        return 1
+    now = time.time()
+    for proc in listed:
+        print(describe(proc, now))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

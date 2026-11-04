@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Network
+Comment=Network applet, using the indicator protocol that the Waybar tray shows
+Exec=nm-applet --indicator

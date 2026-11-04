@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Power menu: lock, logout (i3), suspend, reboot, shutdown.
+# Power menu: lock, logout (Sway or i3), suspend, reboot, shutdown.
 # Dangerous actions ask for confirmation.
 set -u
 
@@ -13,17 +13,31 @@ confirm() {
     [ "$answer" = "Yes" ]
 }
 
-choice=$(printf '%b' \
-    'Lock\0icon\x1fsystem-lock-screen\n' \
-    'Logout\0icon\x1fsystem-log-out\n' \
-    'Suspend\0icon\x1fsystem-suspend\n' \
-    'Reboot\0icon\x1fsystem-reboot\n' \
-    'Shutdown\0icon\x1fsystem-shutdown\n' | menu "Power")
+lock() {
+    if [ -n "${SWAYSOCK:-}" ]; then "$HOME/.config/sway/scripts/lock"; else i3lock --blur 5; fi
+}
+
+logout_wm() {
+    if [ -n "${SWAYSOCK:-}" ]; then swaymsg exit; else i3-msg exit; fi
+}
+
+# Suspend is offered only while logind allows it. Masking the sleep targets turns it
+# off, and `systemctl suspend` would then fail after the screen is already locked.
+can_suspend() {
+    [ "$(busctl call org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager CanSuspend 2>/dev/null)" = 's "yes"' ]
+}
+
+choice=$({
+    printf '%b' 'Lock\0icon\x1fsystem-lock-screen\n' 'Logout\0icon\x1fsystem-log-out\n'
+    can_suspend && printf '%b' 'Suspend\0icon\x1fsystem-suspend\n'
+    printf '%b' 'Reboot\0icon\x1fsystem-reboot\n' 'Shutdown\0icon\x1fsystem-shutdown\n'
+} | menu "Power")
 
 case "$choice" in
-    Lock)     sleep 0.2; i3lock --blur 5 ;;
-    Logout)   confirm "Log out" && i3-msg exit ;;
-    Suspend)  confirm "Suspend" && { sleep 0.2; i3lock --blur 5 & systemctl suspend; } ;;
+    Lock)     sleep 0.2; lock ;;
+    Logout)   confirm "Log out" && logout_wm ;;
+    Suspend)  confirm "Suspend" && { sleep 0.2; lock & systemctl suspend; } ;;
     Reboot)   confirm "Reboot" && systemctl reboot ;;
     Shutdown) confirm "Shut down" && systemctl poweroff ;;
     *)        exit 0 ;;

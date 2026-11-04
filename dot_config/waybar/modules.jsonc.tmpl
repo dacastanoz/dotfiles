@@ -1,0 +1,159 @@
+// Waybar modules, ported from ~/.config/polybar/config.ini. Same click actions. Scripts
+// written for Polybar run through pango-filter, which translates their color tags.
+{
+    "custom/launcher": {
+        "format": "  ",
+        "tooltip": false,
+        "on-click": "~/.local/bin/rofi-launcher",
+        "on-click-right": "~/.local/bin/control-center"
+    },
+    "sway/workspaces": {
+        "format": "{index}",
+        "all-outputs": false,
+        "disable-scroll": true
+    },
+    "sway/mode": { "format": "{}" },
+    "cpu": {
+        "interval": 2,
+        "format": "<span color=\"#88c0d0\">󰻠</span> {usage}%",
+        "tooltip": false
+    },
+    "custom/temperature": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors run temperature ~/.config/waybar/scripts/temperature.sh",
+        "interval": 3,
+        "max-length": 60,
+        "tooltip": false,
+        "on-click": "~/.config/waybar/scripts/temperature.sh --monitor",
+        "on-click-right": "~/.config/waybar/scripts/temperature.sh --summary"
+    },
+    "memory": {
+        "interval": 3,
+        "format": "<span color=\"#88c0d0\">󰍛</span> {used:0.2f} GB",
+        "tooltip": false
+    },
+
+    "clock": {
+        "interval": 5,
+        "format": "<span color=\"#88c0d0\">󰥔</span> {:%a %d %b  %I:%M %p}",
+        "format-alt": "<span color=\"#88c0d0\">󰥔</span> {:%A %d %B %Y  %H:%M:%S}",
+        "tooltip": false
+    },
+
+    // Apps running with no window. Hidden when there are none.
+    "custom/bg-apps": {
+        "exec": "~/.config/sway/scripts/bg-apps --waybar",
+        "return-type": "json",
+        "interval": 5,
+        "signal": 8,
+        "format": "{}",
+        "on-click": "~/.config/sway/scripts/bg-apps --menu",
+        "on-click-right": "ghostty --class=dev.gentleman.popup --window-width=0 --window-height=0 --title=btop -e btop"
+    },
+    "custom/bar-errors": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors",
+        "interval": 30,
+        "max-length": 40,
+        "tooltip": false,
+        "on-click": "~/.local/bin/bar-errors --menu"
+    },
+    "custom/updates": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors run updates ~/.config/waybar/scripts/arch_updates.sh",
+        "interval": 30,
+        "max-length": 60,
+        "tooltip": false,
+        "on-click": "~/.config/waybar/scripts/arch_updates.sh --menu",
+        "on-click-right": "~/.config/waybar/scripts/arch_updates.sh --refresh-bg"
+    },
+    "custom/drive-sync": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors tail drive-sync ~/.local/bin/drive-sync-status --tail",
+        "max-length": 60,
+        "tooltip": false,
+        "on-click": "~/.local/bin/drive-sync-status --click"
+    },
+    "custom/airplane": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors run airplane ~/.config/waybar/scripts/airplane.sh",
+        "interval": 3,
+        "max-length": 60,
+        "tooltip": false,
+        "on-click": "~/.local/bin/control-center airplane"
+    },
+    "pulseaudio": {
+        "scroll-step": 5,
+        "max-volume": 100,
+        "format": "<span color=\"#88c0d0\">{icon}</span> {volume}%",
+        "format-muted": "󰝟 muted",
+        "format-icons": { "default": ["󰕿", "󰖀", "󰕾"] },
+        "tooltip": false,
+        "on-click": "pavucontrol",
+        "on-click-right": "pamixer -t",
+        "on-click-middle": "~/.local/bin/control-center audio"
+    },
+    "network": {
+        // Any wireless interface, as polybar's interface-type = wireless.
+        "interface": "wl*",
+        "interval": 3,
+        "format-wifi": "<span color=\"#88c0d0\">{icon}</span> {essid} {signalStrength}%",
+        "format-linked": "󰤭 offline",
+        "format-disconnected": "󰤭 offline",
+        "format-disabled": "󰤭 offline",
+        "format-icons": ["󰤟", "󰤢", "󰤥", "󰤨", "󰤨"],
+        "tooltip": false,
+        "max-length": 26,
+        "on-click": "~/.local/bin/control-center wifi",
+        "on-click-middle": "~/.local/bin/control-center details",
+        "on-click-right": "nm-connection-editor"
+    },
+    "custom/bluetooth": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors run bluetooth ~/.config/waybar/scripts/bluetooth.sh",
+        "interval": 5,
+        "max-length": 60,
+        "tooltip": false,
+        "on-click": "blueman-manager",
+        "on-click-right": "~/.config/waybar/scripts/bluetooth.sh toggle",
+        "on-click-middle": "~/.local/bin/control-center bluetooth"
+    },
+    "battery": {
+        "bat": "{{ .batteryName | default "BAT1" }}",
+        "adapter": "{{ .adapterName | default "AC" }}",
+        "full-at": 99,
+        "interval": 5,
+        "states": { "yellow": 40, "red": 20, "low": 15 },
+        "format": "<span color=\"#88c0d0\">{icon}</span> {capacity}%",
+        "format-yellow": "<span color=\"#ebcb8b\">{icon}</span> {capacity}%",
+        "format-red": "<span color=\"#bf616a\">{icon}</span> {capacity}%",
+        "format-low": "<span color=\"#bf616a\">{icon} {capacity}% {time}</span>",
+        "format-charging": "<span color=\"#a3be8c\">󰂄</span> {capacity}%",
+        "format-full": "<span color=\"#a3be8c\">󰂅</span> full",
+        "format-time": "{H}:{m}",
+        "format-icons": ["󰁺", "󰁼", "󰁾", "󰂀", "󰁹"],
+        "tooltip": false,
+        "on-click": "~/.local/bin/control-center battery",
+        "on-click-right": "~/.local/bin/battery-status cycle-profile"
+    },
+    "custom/battery-care": {
+        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors tail battery-care ~/.local/bin/battery-status polybar-tail",
+        "max-length": 60,
+        "tooltip": false,
+        "on-click": "~/.local/bin/control-center battery",
+        "on-click-right": "~/.local/bin/battery-status cycle-profile"
+    },
+    "custom/shortcuts": {
+        "format": "<span color=\"#ebcb8b\"><b>󰌌</b></span>",
+        "tooltip": false,
+        "on-click": "~/.local/bin/shortcuts-menu"
+    },
+    "custom/control": {
+        "format": "<span color=\"#88c0d0\"><b>󰒓</b></span>",
+        "tooltip": false,
+        "on-click": "~/.local/bin/control-center"
+    },
+    "custom/power": {
+        "format": "<span color=\"#bf616a\"><b>󰐥</b></span>",
+        "tooltip": false,
+        "on-click": "~/.local/bin/rofi-powermenu"
+    },
+    "tray": {
+        "icon-size": 14,
+        "spacing": 6
+    }
+}
