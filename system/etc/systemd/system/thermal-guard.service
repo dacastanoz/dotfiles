@@ -19,4 +19,4 @@ MemoryMax=64M
 TimeoutStopSec=10
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target

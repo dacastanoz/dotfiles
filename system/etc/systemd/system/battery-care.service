@@ -10,6 +10,6 @@ Type=oneshot
 ExecStart=/usr/local/bin/battery-care boot
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
 # Re-run right after resume: the firmware may reset the health mode.
 WantedBy=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
