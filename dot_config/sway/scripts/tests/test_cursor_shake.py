@@ -1,5 +1,8 @@
+import os
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 
 from tests.loader import load
 
@@ -197,6 +200,147 @@ class CursorSizes(unittest.TestCase):
 
     def test_falls_back_to_request_when_sizes_unknown(self):
         self.assertEqual(cs.pick_large_size(set(), 96), 96)
+
+
+IMAGE = 0xFFFD0002
+
+
+def real_xcursor(*sizes):
+    """A valid Xcursor file with one square image per entry; repeats are animation frames."""
+    toc, chunks = [], []
+    pos = 16 + 12 * len(sizes)
+    for index, size in enumerate(sizes):
+        chunk = struct.pack("<IIIIIIIII", 36, IMAGE, size, 1, size, size, 1, 1, 50) + bytes([index]) * (size * size * 4)
+        toc.append(struct.pack("<III", IMAGE, size, pos))
+        chunks.append(chunk)
+        pos += len(chunk)
+    return b"Xcur" + struct.pack("<III", 16, 0x10000, len(sizes)) + b"".join(toc) + b"".join(chunks)
+
+
+class SlimCursor(unittest.TestCase):
+    def test_keeps_one_image_at_the_wanted_size(self):
+        blob = cs.slim_cursor(real_xcursor(24, 96, 144), 96)
+        self.assertEqual(cs.xcursor_sizes(blob), {96})
+        self.assertEqual(struct.unpack("<I", blob[12:16])[0], 1)
+        self.assertEqual(len(blob), 16 + 12 + 36 + 96 * 96 * 4)
+
+    def test_animated_cursor_keeps_only_its_first_frame(self):
+        blob = cs.slim_cursor(real_xcursor(24, 96, 96, 96), 96)
+        self.assertEqual(struct.unpack("<I", blob[12:16])[0], 1)
+        self.assertEqual(blob[-1], 1)
+
+    def test_nearest_size_when_the_wanted_one_is_absent(self):
+        self.assertEqual(cs.xcursor_sizes(cs.slim_cursor(real_xcursor(24, 72), 96)), {72})
+
+    def test_result_points_at_its_image(self):
+        blob = cs.slim_cursor(real_xcursor(96), 96)
+        self.assertEqual(struct.unpack("<III", blob[16:28]), (IMAGE, 96, 28))
+
+    def test_malformed_data_raises_value_error(self):
+        good = real_xcursor(96)
+        hostile_count = b"Xcur" + struct.pack("<III", 16, 0x10000, 9) + good[16:28]
+        bad_position = good[:24] + struct.pack("<I", 10 ** 8) + good[28:]
+        huge_image = good[:28] + struct.pack("<IIIIII", 36, IMAGE, 96, 1, 60000, 60000) + good[52:]
+        wrong_kind = good[:32] + struct.pack("<I", 1) + good[36:]
+        no_images = b"Xcur" + struct.pack("<III", 16, 0x10000, 0)
+        for data in (b"", b"junk", good[:40], good[:-1], hostile_count, bad_position, huge_image, wrong_kind, no_images):
+            with self.assertRaises(ValueError):
+                cs.slim_cursor(data, 96)
+
+
+class ThemeBuild(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.src = self.root / "source"
+        (self.src / "cursors").mkdir(parents=True)
+        (self.src / "cursors/left_ptr").write_bytes(real_xcursor(24, 96))
+        (self.src / "cursors/wait").write_bytes(real_xcursor(24, 96, 96))
+        (self.src / "cursors/default").symlink_to("left_ptr")
+        self.dst = self.root / "icons/shake"
+
+    def test_builds_same_names_and_links_with_one_image_each(self):
+        cs.build_theme(self.src, self.dst, 96)
+        self.assertEqual(sorted(os.listdir(self.dst / "cursors")), ["default", "left_ptr", "wait"])
+        self.assertEqual(os.readlink(self.dst / "cursors/default"), "left_ptr")
+        data = (self.dst / "cursors/wait").read_bytes()
+        self.assertEqual(struct.unpack("<I", data[12:16])[0], 1)
+        self.assertTrue((self.dst / "index.theme").exists())
+
+    def test_malformed_cursor_is_skipped_not_fatal(self):
+        (self.src / "cursors/broken").write_bytes(b"junk")
+        cs.build_theme(self.src, self.dst, 96)
+        self.assertFalse((self.dst / "cursors/broken").exists())
+        self.assertTrue((self.dst / "cursors/wait").exists())
+
+    def test_fails_without_a_usable_main_cursor_and_keeps_the_old_theme(self):
+        cs.build_theme(self.src, self.dst, 96)
+        before = (self.dst / "cursors/left_ptr").read_bytes()
+        (self.src / "cursors/left_ptr").write_bytes(b"junk")
+        with self.assertRaises(ValueError):
+            cs.build_theme(self.src, self.dst, 96)
+        self.assertEqual((self.dst / "cursors/left_ptr").read_bytes(), before)
+
+    def test_leaves_no_temporary_directory_on_success_or_failure(self):
+        cs.build_theme(self.src, self.dst, 96)
+        (self.src / "cursors/left_ptr").write_bytes(b"junk")
+        with self.assertRaises(ValueError):
+            cs.build_theme(self.src, self.dst, 96)
+        self.assertEqual(os.listdir(self.dst.parent), ["shake"])
+
+    def test_rebuild_replaces_the_old_theme(self):
+        cs.build_theme(self.src, self.dst, 96)
+        (self.dst / "cursors/stale-file").write_bytes(b"x")
+        cs.build_theme(self.src, self.dst, 96)
+        self.assertFalse((self.dst / "cursors/stale-file").exists())
+        self.assertEqual(os.listdir(self.dst.parent), ["shake"])
+
+    def test_staleness(self):
+        self.assertTrue(cs.theme_is_stale(self.src, self.dst))
+        cs.build_theme(self.src, self.dst, 96)
+        self.assertFalse(cs.theme_is_stale(self.src, self.dst))
+        newer = (self.dst / "cursors").stat().st_mtime + 100
+        os.utime(self.src / "cursors/wait", (newer, newer))
+        self.assertTrue(cs.theme_is_stale(self.src, self.dst))
+
+    def test_prepare_returns_the_slim_theme(self):
+        self.assertEqual(cs.prepare_large_cursor(self.src, self.dst, 96), (self.dst.name, 96))
+        self.assertTrue((self.dst / "cursors/left_ptr").exists())
+
+    def test_prepare_does_not_rebuild_a_fresh_theme(self):
+        cs.prepare_large_cursor(self.src, self.dst, 96)
+        marker = self.dst / "cursors/marker"
+        marker.write_bytes(b"x")
+        old = (self.src / "cursors/left_ptr").stat().st_mtime
+        os.utime(self.dst / "cursors", (old + 100, old + 100))
+        cs.prepare_large_cursor(self.src, self.dst, 96)
+        self.assertTrue(marker.exists())
+
+    def test_prepare_falls_back_to_the_full_theme_when_the_build_fails(self):
+        with self.assertLogs("cursor-shake", level="WARNING"):
+            result = cs.prepare_large_cursor(self.root / "missing", self.dst, 96)
+        self.assertEqual(result, (cs.THEME, 96))
+        self.assertFalse(self.dst.exists())
+
+
+class ControllerWithThemes(unittest.TestCase):
+    def test_enlarge_uses_the_slim_theme_and_revert_the_normal_one(self):
+        applied = []
+        ctl = cs.CursorController(applied.append, normal=(cs.THEME, 24), large=("capitaine-shake", 96), hold=1.0)
+        ctl.on_shake(0.0)
+        ctl.close()
+        self.assertEqual(applied, [("capitaine-shake", 96), (cs.THEME, 24)])
+
+    def test_set_cursor_sends_theme_and_size_without_a_shell(self):
+        calls = []
+        saved = cs.subprocess.run
+        cs.subprocess.run = lambda cmd, **kw: calls.append(cmd)
+        try:
+            cs.set_cursor(("capitaine-shake", 96))
+        finally:
+            cs.subprocess.run = saved
+        self.assertEqual(calls, [["swaymsg", "seat", cs.SEAT, "xcursor_theme", "capitaine-shake", "96"]])
 
 
 if __name__ == "__main__":

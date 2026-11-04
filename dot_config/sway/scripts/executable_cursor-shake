@@ -5,6 +5,10 @@
     cursor-shake --simulate   play a synthetic shake through the real handler, then
                               idle until the size reverts. Needs no device access.
 
+Enlarging loads a cursor theme, and Sway stalls while it does. A full theme holds many
+sizes and animation frames, so at startup this builds a slim copy with one static image
+per cursor in ~/.local/share/icons/capitaine-shake. If that fails, it uses the full theme.
+
 Only pointer devices are opened. Each device is classified from sysfs first, so a
 keyboard is never opened, and only motion and finger events are read.
 """
@@ -13,11 +17,14 @@ import glob
 import logging
 import os
 import select
+import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 # ---- Detector tuning. Units are mouse counts, or TOUCHPAD_UNITS_PER_MM on a touchpad.
 WINDOW_S = 0.7            # reversals must fall inside this window
@@ -35,7 +42,11 @@ NORMAL_SIZE = 24
 REQUESTED_LARGE_SIZE = 96
 HOLD_S = 1.0              # revert after this long without a shake
 SEAT = "seat0"
-CURSOR_FILE = f"/usr/share/icons/{THEME}/cursors/left_ptr"
+SOURCE_THEME = Path("/usr/share/icons") / THEME
+CURSOR_FILE = SOURCE_THEME / "cursors/left_ptr"
+SLIM_THEME = Path.home() / ".local/share/icons/capitaine-shake"
+XCURSOR_IMAGE = 0xFFFD0002
+MAX_CURSOR_SIDE = 0x7FFF  # limit in the Xcursor format
 
 # ---- Daemon
 RESCAN_S = 3              # look for new or removed devices
@@ -226,6 +237,103 @@ def pick_large_size(available, requested):
     return max(fitting) if fitting else requested
 
 
+def _image_entries(data):
+    """(nominal size, position) of each image in an Xcursor file."""
+    if len(data) < 16 or data[:4] != b"Xcur":
+        raise ValueError("not an Xcursor file")
+    count = struct.unpack_from("<I", data, 12)[0]
+    if 16 + count * 12 > len(data):
+        raise ValueError("truncated table of contents")
+    entries = []
+    for index in range(count):
+        kind, size, position = struct.unpack_from("<III", data, 16 + index * 12)
+        if kind == XCURSOR_IMAGE:
+            entries.append((size, position))
+    if not entries:
+        raise ValueError("no images")
+    return entries
+
+
+def slim_cursor(data, wanted):
+    """An Xcursor file holding only the first image nearest to the wanted size.
+
+    Raises ValueError on malformed data.
+    """
+    entries = _image_entries(data)
+    size = min({s for s, _ in entries}, key=lambda s: (abs(s - wanted), -s))
+    position = next(p for s, p in entries if s == size)
+    if position + 36 > len(data):
+        raise ValueError("image header out of bounds")
+    header_size, kind, _, _, width, height = struct.unpack_from("<IIIIII", data, position)
+    if kind != XCURSOR_IMAGE or header_size < 36 or not 0 < width <= MAX_CURSOR_SIDE or not 0 < height <= MAX_CURSOR_SIDE:
+        raise ValueError("bad image header")
+    end = position + header_size + width * height * 4
+    if end > len(data):
+        raise ValueError("image data out of bounds")
+    return (b"Xcur" + struct.pack("<III", 16, 0x10000, 1) + struct.pack("<III", XCURSOR_IMAGE, size, 28)
+            + data[position:end])
+
+
+def _write_slim_cursors(source, target, wanted):
+    for entry in sorted(source.iterdir()):
+        destination = target / entry.name
+        if entry.is_symlink():
+            destination.symlink_to(os.readlink(entry))
+            continue
+        try:
+            destination.write_bytes(slim_cursor(entry.read_bytes(), wanted))
+        except ValueError as exc:
+            log.warning("skipping cursor %s: %s", entry.name, exc)
+
+
+def build_theme(source, target, wanted):
+    """Build the slim theme beside target, then swap it in. Raises OSError or ValueError."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
+    old = None
+    try:
+        (temporary / "cursors").mkdir()
+        _write_slim_cursors(Path(source) / "cursors", temporary / "cursors", wanted)
+        if not (temporary / "cursors/left_ptr").is_file():
+            raise ValueError("no usable left_ptr cursor")
+        (temporary / "index.theme").write_text("[Icon Theme]\nName=Capitaine Shake\n"
+                                               "Comment=Built by cursor-shake: one image per cursor\n")
+        temporary.chmod(0o755)
+        if target.exists():
+            old = Path(tempfile.mkdtemp(prefix=f".{target.name}.old.", dir=target.parent))
+            target.rename(old / "theme")
+        temporary.rename(target)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def theme_is_stale(source, target):
+    """True when the slim theme is missing or older than anything in the source theme."""
+    cursors = Path(source) / "cursors"
+    try:
+        built = (Path(target) / "cursors").stat().st_mtime
+        (Path(target) / "cursors/left_ptr").stat()
+    except OSError:
+        return True
+    newest = max([cursors.stat().st_mtime] + [entry.lstat().st_mtime for entry in cursors.iterdir()])
+    return newest > built
+
+
+def prepare_large_cursor(source, target, wanted):
+    """The (theme, size) to enlarge with: the slim theme, or the full one if it can't be built."""
+    try:
+        if theme_is_stale(source, target):
+            build_theme(source, target, wanted)
+            log.info("built the slim cursor theme at %s", target)
+        return (Path(target).name, wanted)
+    except (OSError, ValueError) as exc:
+        log.warning("could not build the slim cursor theme, using %s: %s", THEME, exc)
+        return (THEME, wanted)
+
+
 # ---------------------------------------------------------------- system access
 def large_size():
     try:
@@ -235,9 +343,10 @@ def large_size():
         return REQUESTED_LARGE_SIZE
 
 
-def set_cursor_size(size):
+def set_cursor(cursor):
+    theme, size = cursor
     try:
-        subprocess.run(["swaymsg", "seat", SEAT, "xcursor_theme", THEME, str(size)],
+        subprocess.run(["swaymsg", "seat", SEAT, "xcursor_theme", theme, str(size)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("could not set the cursor size: %s", exc)
@@ -417,11 +526,13 @@ def main():
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, _raise_stop)
 
-    controller = CursorController(set_cursor_size, NORMAL_SIZE, large_size(), args.hold)
+    normal = (THEME, NORMAL_SIZE)
+    large = prepare_large_cursor(SOURCE_THEME, SLIM_THEME, large_size())
+    controller = CursorController(set_cursor, normal, large, args.hold)
     try:
         if args.simulate:
             return run_simulation(controller, args.hold)
-        set_cursor_size(NORMAL_SIZE)  # clear anything left by a previous crash
+        set_cursor(normal)  # clear anything left by a previous crash
         run_daemon(controller)
     except Stop:
         pass
