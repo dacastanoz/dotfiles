@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from tests.loader import load
@@ -27,6 +28,21 @@ class Convert(unittest.TestCase):
 
     def test_other_polybar_tags_are_removed(self):
         self.assertEqual(pf.convert("%{A1:cmd:}x%{A}%{B#000}y%{B-}"), "xy")
+
+
+class JsonMode(unittest.TestCase):
+    def test_json_lines_pass_through_untouched(self):
+        line = '{"text":"<span color=\\"#fff\\">x</span> a &amp; b","tooltip":"t","class":"ok"}'
+        self.assertEqual(pf.convert_json(line), line)
+
+    def test_plain_lines_are_wrapped_as_json(self):
+        out = json.loads(pf.convert_json("%{F#bf616a}!%{F-} a & b"))
+        self.assertEqual(out["text"], '<span color="#bf616a">!</span> a &amp; b')
+        self.assertEqual(out["class"], "error")
+
+    def test_bad_json_is_wrapped_not_passed(self):
+        out = json.loads(pf.convert_json('{"text": oops'))
+        self.assertEqual(out["class"], "error")
 
 
 if __name__ == "__main__":

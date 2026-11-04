@@ -65,9 +65,10 @@
         "on-click-right": "~/.config/waybar/scripts/arch_updates.sh --refresh-bg"
     },
     "custom/drive-sync": {
-        "exec": "~/.config/sway/scripts/pango-filter ~/.local/bin/bar-errors tail drive-sync ~/.local/bin/drive-sync-status --tail",
+        "exec": "~/.config/sway/scripts/pango-filter --json ~/.local/bin/bar-errors tail drive-sync ~/.local/bin/drive-sync-status --waybar",
+        "return-type": "json",
         "max-length": 60,
-        "tooltip": false,
+        "tooltip": true,
         "on-click": "~/.local/bin/drive-sync-status --click"
     },
     "custom/airplane": {

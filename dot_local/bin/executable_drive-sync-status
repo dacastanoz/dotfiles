@@ -1,18 +1,25 @@
 #!/bin/bash
-# drive-sync-status: polybar status + rofi menu for drive-sync (rclone bisync).
+# drive-sync-status: bar status + rofi menu for drive-sync (rclone bisync).
 #
 # Usage:
-#   drive-sync-status                  polybar-formatted status line (one shot)
-#   drive-sync-status --tail           polybar tail mode: redraws every 2 s while a sync
-#                                      runs (progress %), every 20 s otherwise; SIGUSR1 = now
-#   drive-sync-status --plain          status line without polybar color tags
-#   drive-sync-status --long           per-remote details (terminal / rofi message)
-#   drive-sync-status --click          rofi menu (sync now, pending, verify, evidence, logs)
+#   drive-sync-status                  status line with polybar-style color tags (one shot)
+#   drive-sync-status --waybar         Waybar loop: one JSON line every 2 s while a sync runs,
+#                                      every 20 s otherwise; SIGUSR1 = now
+#   drive-sync-status --json           one JSON line (text, tooltip, class)
+#   drive-sync-status --tail           same loop as --waybar, in the one-shot format above
+#   drive-sync-status --plain          status line without tags
+#   drive-sync-status --long           per-remote details (terminal)
+#   drive-sync-status --click          rofi menu
+#   drive-sync-status --sync-now       start a manual sync (ignores backoff and the battery floor)
 #   drive-sync-status --pending NAME   print "new modified deleted" local changes not yet synced
 #   drive-sync-status --check-remote [NAME]
 #                                      list Drive (read-only, no lock) and store the Drive-side
 #                                      pending counts in ~/.local/state/drive-sync/NAME.remote
 #   drive-sync-status --details NAME   rofi view: last sync evidence (counts + changed paths)
+#   drive-sync-status --allow-deletes NAME [--typed TEXT]
+#                                      one-time permission for the deletions the cap stopped
+#   drive-sync-status --resync-flow NAME
+#                                      terminal flow: pause timer, preview, typed confirmation
 #
 # Pending counts:
 #   local  = current files under the local folder vs bisync's saved listing (path2.lst):
@@ -21,13 +28,6 @@
 #            $XDG_RUNTIME_DIR/drive-sync/NAME.local.
 #   Drive  = set to 0 after every successful sync, exact after "Verify now" (bisync dry-run),
 #            or measured by --check-remote (one recursive listing vs path1.lst).
-#
-# polybar:
-#   [module/drive-sync]
-#   type = custom/script
-#   exec = ~/.local/bin/bar-errors tail drive-sync ~/.local/bin/drive-sync-status --tail
-#   tail = true
-#   click-left = ~/.local/bin/drive-sync-status --click &
 
 set -u
 export LC_ALL=C.UTF-8
@@ -38,6 +38,13 @@ RUNS_DIR="$STATE_DIR/runs"
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/drive-sync"
 PROGRESS="$RUN_DIR/progress"
 NOTIFY_FLAG="$RUN_DIR/notify-when-done"
+MANUAL_FLAG="$RUN_DIR/manual-request"
+HISTORY="$STATE_DIR/history.jsonl"
+BACKUP_ROOT="$HOME/.local/share/drive-sync/backup"
+DRIVE_SYNC_BIN="${DRIVE_SYNC_BIN:-$HOME/.local/bin/drive-sync}"
+# shellcheck disable=SC2088 # shown to the user as text
+OAUTH_GUIDE="~/.local/share/chezmoi/docs/drive-sync-oauth-client.md"
+STALE_SECONDS="${DRIVE_SYNC_STALE_SECONDS:-3600}"
 LOGFILE="$HOME/.local/share/rclone/bisync.log"
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/drive-sync-${UID}.lock"
 FILTERS="$HOME/.config/rclone/bisync-filters.txt"
@@ -73,6 +80,7 @@ ICON_ERR=$'\U000F09E0'     # nf-md-cloud_alert
 ICON_OFF=$'\U000F0164'     # nf-md-cloud_off_outline
 
 C_OK="#A3BE8C" C_SYNC="#88C0D0" C_ERR="#BF616A" C_WARN="#EBCB8B" C_OFF="#616E88"
+POPUP_ARGS=(--class=dev.gentleman.popup --window-width=0 --window-height=0)
 
 status_get() { # file key
     [ -f "$1" ] || return 0
@@ -118,14 +126,15 @@ is_syncing() {
     ! flock -n "$LOCKFILE" true 2>/dev/null
 }
 
-refresh_bar() { pkill -USR1 -f '^[^ ]*bash [^ ]*/drive-sync-status --tail$' 2>/dev/null || true; }
+refresh_bar() { pkill -USR1 -f '^[^ ]*bash [^ ]*/drive-sync-status --(tail|waybar)$' 2>/dev/null || true; }
 
 # bisync keeps its listings as <path1>..<path2>.path{1,2}.lst; path2 = the local folder
 # with "/" -> "_" (leading "/" dropped).
 listing_file() { # name 1|2
     local dir="${RDIR[$1]:-}" key f
     [ -n "$dir" ] || return 1
-    key="${dir#/}"; key="${key%/}"; key="${key//\//_}"
+    # rclone's CanonicalPath: trim slashes, then whitespace and \ / : ? * become _
+    key="${dir#/}"; key="${key%/}"; key="${key//[[:space:]\\\/:?*]/_}"
     for f in "$BISYNC_CACHE"/*.."$key".path"$2".lst; do
         [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
     done
@@ -236,17 +245,25 @@ check_remote() { # name
 
 sum3() { echo $(( ${1:-0} + ${2:-0} + ${3:-0} )); }
 
-# Short progress text from the progress file: "1/3 my_drive 45%" / "my_drive listing".
+# Short progress text: "my_drive listing 1m12s" / "my_drive 45% 12/30".
 progress_text() {
-    local remote idx total phase pct t
+    local remote phase pct started files_done files_total mode t now
     remote=$(status_get "$PROGRESS" remote)
-    idx=$(status_get "$PROGRESS" index)
-    total=$(status_get "$PROGRESS" total)
     phase=$(status_get "$PROGRESS" phase)
     pct=$(status_get "$PROGRESS" percent)
+    started=$(status_get "$PROGRESS" started)
+    files_done=$(status_get "$PROGRESS" files_done)
+    files_total=$(status_get "$PROGRESS" files_total)
+    mode=$(status_get "$PROGRESS" mode)
+    now=$(date +%s)
     t="$remote"
-    [ "${total:-1}" -gt 1 ] 2>/dev/null && t="$idx/$total $t"
-    if [ -n "$pct" ]; then t="$t $pct%"; else t="$t ${phase:-starting}"; fi
+    case "$mode" in dry-run|resync-preview) t="checking $t" ;; esac
+    if [ -n "$pct" ]; then
+        t="$t $pct%"
+        [ "${files_total:-0}" -gt 0 ] 2>/dev/null && t="$t $files_done/$files_total"
+    else
+        t="$t ${phase:-starting} $(fmt_duration $((now - ${started:-$now})))"
+    fi
     printf '%s' "$t"
 }
 
@@ -265,40 +282,90 @@ progress_long() { # one line for the menu header
     echo
 }
 
-print_status() { # plain(0/1)
-    local plain="$1" icon color text n st worst="" oldest_ok=0 all_offline=1 last_ok up=0 down=0 ln lm ld rn rmod rd
+# What needs a person, as a short bar label. Empty when nothing does. Status files from older
+# versions have no streak; an error there was already worth showing.
+critical_label() { # name state
+    local streak
+    streak=$(status_get "$STATE_DIR/$1.status" streak)
+    case "$2" in
+        needs-resync) echo resync ;;
+        gdoc-edit) echo "edit Doc in browser" ;;
+        too-many-deletes) echo deletes ;;
+        access-check) echo "access check" ;;
+        delete-cap) echo "$(status_get "$STATE_DIR/$1.status" delete_count) deletes" ;;
+        auth) [ "${streak:-2}" -ge 2 ] && echo auth ;;
+        error) [ "${streak:-2}" -ge 2 ] && echo error ;;
+        hung) [ "${streak:-2}" -ge 2 ] && echo hung ;;
+    esac
+    return 0
+}
+
+# Fills BAR_ICON BAR_COLOR BAR_TEXT BAR_CLASS. First match wins: a sync in progress (still
+# counting problems), then what needs a person, skips, retries, staleness, healthy.
+compute_status() {
+    local n st last_ok now label first_critical="" first_label="" critical=0
+    local transient="" transient_text="" offline=0 first_offline="" battery=0 total=0 seen=0
+    local oldest_ok=0 up=0 down=0 ln lm ld rn rmod rd next text
+    now=$(date +%s)
     for n in "${NAMES[@]}"; do
+        total=$((total + 1))
         st=$(status_get "$STATE_DIR/$n.status" state)
         last_ok=$(status_get "$STATE_DIR/$n.status" last_ok)
-        [ "$st" = offline ] || all_offline=0
-        case "$st" in
-            needs-resync|auth|too-many-deletes|error) worst="$st" ;;
-            rate-limited|locked) [ -z "$worst" ] && worst="$st" ;;
-        esac
-        # The status line shows the oldest successful sync among remotes.
+        [ -n "$st" ] && seen=$((seen + 1))
         if [ "${last_ok:-0}" -gt 0 ] 2>/dev/null; then
             if [ "$oldest_ok" -eq 0 ] || [ "$last_ok" -lt "$oldest_ok" ]; then oldest_ok="$last_ok"; fi
         fi
+        label=$(critical_label "$n" "$st")
+        if [ -n "$label" ]; then
+            critical=$((critical + 1))
+            [ -n "$first_critical" ] || { first_critical=$n; first_label=$label; }
+            continue
+        fi
+        case "$st" in
+            offline) offline=$((offline + 1)); [ -n "$first_offline" ] || first_offline=$n ;;
+            battery-skip) battery=$((battery + 1)) ;;
+            network|rate-limited|locked|interrupted|hung|error|auth)
+                if [ -z "$transient" ]; then
+                    transient=$n
+                    next=$(status_get "$STATE_DIR/$n.status" next_attempt)
+                    if [ "$st" = interrupted ]; then transient_text="$n interrupted"
+                    elif [ "${next:-0}" -gt "$now" ] 2>/dev/null; then transient_text="$n retry $(date -d "@$next" +%H:%M)"
+                    else transient_text="$n retry next run"; fi
+                fi ;;
+        esac
     done
 
-    if is_syncing && [ -f "$PROGRESS" ]; then
-        icon="$ICON_SYNC" color="$C_SYNC" text="$(progress_text)"
-    elif is_syncing; then
-        icon="$ICON_SYNC" color="$C_SYNC" text="sync"
-    elif [ "${#NAMES[@]}" -eq 0 ] || [ ! -d "$STATE_DIR" ] || [ -z "$(fd -e status . "$STATE_DIR" 2>/dev/null)" ]; then
-        icon="$ICON_OFF" color="$C_OFF" text="n/a"
-    elif [ "$all_offline" -eq 1 ]; then
-        icon="$ICON_OFF" color="$C_OFF" text="offline"
-    elif [ -n "$worst" ]; then
-        case "$worst" in
-            rate-limited|locked) icon="$ICON_ERR" color="$C_WARN" text="retry" ;;
-            needs-resync) icon="$ICON_ERR" color="$C_ERR" text="resync" ;;
-            auth) icon="$ICON_ERR" color="$C_ERR" text="auth" ;;
-            too-many-deletes) icon="$ICON_ERR" color="$C_ERR" text="deletes" ;;
-            *) icon="$ICON_ERR" color="$C_ERR" text="error" ;;
-        esac
+    BAR_ICON="$ICON_OK" BAR_COLOR="$C_OK" BAR_CLASS=ok
+    if is_syncing; then
+        BAR_ICON="$ICON_SYNC" BAR_COLOR="$C_SYNC" BAR_CLASS=syncing
+        if [ -f "$PROGRESS" ]; then BAR_TEXT="$(progress_text)"; else BAR_TEXT="syncing"; fi
+        if [ "$critical" -eq 1 ]; then BAR_TEXT="$BAR_TEXT · 1 problem"
+        elif [ "$critical" -gt 1 ]; then BAR_TEXT="$BAR_TEXT · $critical problems"; fi
+    elif [ "$total" -eq 0 ]; then
+        BAR_ICON="$ICON_OFF" BAR_COLOR="$C_OFF" BAR_CLASS=offline BAR_TEXT="no remotes set up"
+    elif [ "$critical" -gt 0 ]; then
+        BAR_ICON="$ICON_ERR" BAR_COLOR="$C_ERR" BAR_CLASS=critical BAR_TEXT="$first_critical $first_label"
+        [ "$critical" -gt 1 ] && BAR_TEXT="$BAR_TEXT +$((critical - 1))"
+    elif [ "$seen" -eq 0 ]; then
+        BAR_ICON="$ICON_OFF" BAR_COLOR="$C_OFF" BAR_CLASS=offline BAR_TEXT="no sync yet"
+    elif [ "$battery" -gt 0 ]; then
+        BAR_ICON="$ICON_OFF" BAR_COLOR="$C_WARN" BAR_CLASS=battery BAR_TEXT="paused: battery low"
+    elif [ "$offline" -eq "$total" ]; then
+        BAR_ICON="$ICON_OFF" BAR_COLOR="$C_OFF" BAR_CLASS=offline BAR_TEXT="offline"
+    elif [ "$offline" -gt 0 ]; then
+        BAR_ICON="$ICON_OFF" BAR_COLOR="$C_OFF" BAR_CLASS=offline BAR_TEXT="$first_offline offline"
+        [ "$offline" -gt 1 ] && BAR_TEXT="$BAR_TEXT +$((offline - 1))"
+    elif [ -n "$transient" ]; then
+        BAR_ICON="$ICON_ERR" BAR_COLOR="$C_WARN" BAR_CLASS=warning BAR_TEXT="$transient_text"
+    elif [ "$oldest_ok" -gt 0 ] && [ $((now - oldest_ok)) -ge "$STALE_SECONDS" ]; then
+        BAR_ICON="$ICON_ERR" BAR_COLOR="$C_WARN" BAR_CLASS=warning BAR_TEXT="no sync for $(ago "$oldest_ok")"
     else
-        icon="$ICON_OK" color="$C_OK" text="$(ago "$oldest_ok")"
+        text=$(ago "$oldest_ok")
+        case "$text" in
+            now) text="synced just now" ;;
+            never) text="no sync yet" ;;
+            *) text="synced $text ago" ;;
+        esac
         # Pending changes (local cached 60 s; Drive side as last measured).
         for n in "${NAMES[@]}"; do
             read -r ln lm ld _ < <(local_pending "$n")
@@ -309,20 +376,134 @@ print_status() { # plain(0/1)
         done
         [ "$up" -gt 0 ] && text="$text ↑$up"
         [ "$down" -gt 0 ] && text="$text ↓$down"
-    fi
-
-    if [ "$plain" -eq 1 ]; then
-        echo "$icon $text"
-    else
-        echo "%{F$color}$icon%{F-} $text"
+        BAR_TEXT="$text"
     fi
 }
 
-tail_loop() {
+markup() { # text -> Pango-safe text
+    local t="$1"
+    t=${t//&/\&amp;}; t=${t//</\&lt;}; t=${t//>/\&gt;}
+    printf '%s' "$t"
+}
+
+json_string() { # text -> JSON string body
+    local t="$1"
+    t=${t//\\/\\\\}; t=${t//\"/\\\"}; t=${t//$'\n'/\\n}; t=${t//$'\t'/\\t}; t=${t//$'\r'/}
+    printf '%s' "$t"
+}
+
+clock() { # epoch -> HH:MM, or date and time when older than a day
+    local fmt='%H:%M'
+    [ $(( $(date +%s) - $1 )) -ge 86400 ] && fmt='%d %b %H:%M'
+    date -d "@$1" +"$fmt"
+}
+
+tooltip_remote() { # name
+    local n="$1" f st msg detail last_ok streak first next dur summary dups ln lm ld line now
+    f="$STATE_DIR/$n.status"
+    now=$(date +%s)
+    st=$(status_get "$f" state); msg=$(status_get "$f" message); detail=$(status_get "$f" detail)
+    last_ok=$(status_get "$f" last_ok); streak=$(status_get "$f" streak)
+    first=$(status_get "$f" first_fail_at); next=$(status_get "$f" next_attempt)
+    dur=$(status_get "$f" last_duration); summary=$(status_get "$f" last_summary); dups=$(status_get "$f" duplicates)
+    case "$st" in
+        ok|pending)
+            line="$n: ok, $(ago_long "$last_ok")"
+            [ -n "$dur" ] && line="$line, took $(fmt_duration "$dur")"
+            [ -n "$summary" ] && line="$line, $summary" ;;
+        "") line="$n: no sync yet" ;;
+        offline|battery-skip) line="$n: $msg. Last ok $(ago_long "$last_ok")" ;;
+        *)
+            line="$n: ${st^^}"
+            [ "${first:-0}" -gt 0 ] 2>/dev/null && line="$line since $(clock "$first")"
+            if [ "${streak:-0}" -eq 1 ] 2>/dev/null; then line="$line (1 failure)"
+            elif [ "${streak:-0}" -gt 1 ] 2>/dev/null; then line="$line ($streak failures)"; fi
+            line="$line. Last ok $(ago_long "$last_ok")"
+            [ -n "$msg" ] && line="$line"$'\n'"  $msg"
+            # The file name of a Google Doc error stays in the status file and the menu.
+            [ -n "$detail" ] && [ "$st" != gdoc-edit ] && line="$line"$'\n'"  ${detail:0:200}"
+            [ "${next:-0}" -gt "$now" ] 2>/dev/null && line="$line"$'\n'"  Next try $(clock "$next")" ;;
+    esac
+    case "$st" in
+        ok|pending)
+            read -r ln lm ld _ < <(local_pending "$n")
+            [ "$ln" != "?" ] && [ "$(sum3 "$ln" "$lm" "$ld")" -gt 0 ] && line="$line, ↑$(sum3 "$ln" "$lm" "$ld") waiting"
+            [ "${dups:-0}" -gt 0 ] 2>/dev/null && line="$line, $dups duplicate(s) on Drive ignored" ;;
+    esac
+    printf '%s' "$line"
+}
+
+history_24h() { # "24h: 141 ok, 3 failed", cached 60 s
+    local f="$RUN_DIR/history-24h" ok bad
+    [ -f "$HISTORY" ] || return 0
+    if [ -s "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 60 ] && [ "$f" -nt "$HISTORY" ]; then
+        cat "$f"
+        return 0
+    fi
+    read -r ok bad < <(tail -n 3000 "$HISTORY" | jq -r --argjson min "$(( $(date +%s) - 86400 ))" \
+        'select((.ended // 0) >= $min) | .result' 2>/dev/null | awk '$0 == "ok" { o++ } $0 != "ok" { b++ } END { printf "%d %d\n", o, b }')
+    mkdir -p "$RUN_DIR"
+    printf '24h: %d ok, %d failed' "${ok:-0}" "${bad:-0}" | tee "$f"
+}
+
+backups_size() { # human size, cached 5 min
+    local f="$RUN_DIR/backups-size" size
+    [ -d "$BACKUP_ROOT" ] || return 0
+    if [ -s "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 300 ]; then
+        cat "$f"
+        return 0
+    fi
+    size=$(du -sh "$BACKUP_ROOT" 2>/dev/null | cut -f1)
+    mkdir -p "$RUN_DIR"
+    printf '%s' "$size" | tee "$f"
+}
+
+# Remotes whose latest run printed rclone's shared-client notice, by their rclone names.
+shared_client_remotes() {
+    local n list=""
+    for n in "${NAMES[@]}"; do
+        [ -e "$STATE_DIR/$n.shared-client-id" ] && list="$list ${RREMOTE[$n]}"
+    done
+    printf '%s' "${list# }"
+}
+
+build_tooltip() {
+    local n out="" next foot="" h size shared
+    for n in "${NAMES[@]}"; do out="$out$(tooltip_remote "$n")"$'\n'; done
+    next=$(systemctl --user show drive-sync.timer -p NextElapseUSecRealtime --value 2>/dev/null)
+    if [ -n "$next" ] && [ "$next" != "n/a" ]; then
+        foot="Next run $(date -d "$next" +%H:%M 2>/dev/null || echo "$next")"
+    else
+        foot="Timer inactive"
+    fi
+    size=$(backups_size)
+    [ -n "$size" ] && foot="$foot · Backups $size"
+    h=$(history_24h)
+    [ -n "$h" ] && foot="$foot · $h"
+    out="$out$foot"
+    shared=$(shared_client_remotes)
+    [ -n "$shared" ] && out="$out"$'\n'"Warning: $shared still on rclone's shared client, which is being retired. Guide: $OAUTH_GUIDE"
+    printf '%s' "$out"
+}
+
+print_status() { # polybar|plain|json
+    compute_status
+    case "$1" in
+        plain) echo "$BAR_ICON $BAR_TEXT" ;;
+        polybar) echo "%{F$BAR_COLOR}$BAR_ICON%{F-} $BAR_TEXT" ;;
+        json)
+            local text tooltip
+            text="<span color=\"$BAR_COLOR\">$BAR_ICON</span> $(markup "$BAR_TEXT")"
+            tooltip=$(markup "$(build_tooltip)")
+            printf '{"text":"%s","tooltip":"%s","class":"%s"}\n' "$(json_string "$text")" "$(json_string "$tooltip")" "$BAR_CLASS" ;;
+    esac
+}
+
+tail_loop() { # format
     local pid="" delay
     trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null' USR1
     while :; do
-        print_status 0
+        print_status "$1"
         if is_syncing; then delay=2; else delay=20; fi
         sleep "$delay" & pid=$!
         wait "$pid"
@@ -360,6 +541,9 @@ remote_line() { # name markup(0/1)
     if [ "$markup" -eq 1 ]; then
         local line="$glyph <b>$n</b>  "
         [ "$st" = ok ] || line="$line<span foreground='$C_ERR'>$st: $(printf '%s' "$msg" | esc)</span> · "
+        local detail
+        detail=$(status_get "$f" detail)
+        [ -n "$detail" ] && line="$line<i>$(printf '%s' "${detail:0:200}" | esc)</i> · "
         line="${line}synced $(ago_long "$last_ok")"
         [ -n "$dur" ] && line="$line · took $dur · $counts"
         line="$line · <i>pending $pend</i>"
@@ -390,7 +574,7 @@ print_long() {
 }
 
 term() { # command...
-    setsid -f "$TERMINAL" --class=dev.gentleman.popup -e "$@" >/dev/null 2>&1
+    setsid -f "$TERMINAL" "${POPUP_ARGS[@]}" -e "$@" >/dev/null 2>&1
 }
 
 header_mesg() {
@@ -402,14 +586,14 @@ header_mesg() {
     else
         next=$(systemctl --user show drive-sync.timer -p NextElapseUSecRealtime --value 2>/dev/null)
         if [ -n "$next" ] && [ "$next" != "n/a" ]; then
-            echo "Idle · next automatic sync $(date -d "$next" +%H:%M 2>/dev/null || echo "$next") (every 10 min)"
+            echo "Idle · next automatic sync $(date -d "$next" +%H:%M 2>/dev/null || echo "$next")"
         else
             echo "Idle · automatic sync timer inactive"
         fi
     fi
-    if fd -g '*.shared-client-id' "$STATE_DIR" -q 2>/dev/null; then
-        warn="<span foreground='$C_WARN'>⚠ Remotes use rclone's shared Google client_id: rate limited (slow listings) and being retired in 2026. Create your own client_id (rclone.org/drive/#making-your-own-client-id).</span>"
-        echo "$warn"
+    warn=$(shared_client_remotes)
+    if [ -n "$warn" ]; then
+        echo "<span foreground='$C_WARN'>⚠ $(printf '%s' "$warn" | esc) still on rclone's shared client, which is being retired. Guide: $OAUTH_GUIDE</span>"
     fi
 }
 
@@ -419,6 +603,7 @@ start_sync() {
     if is_syncing; then
         notify "Drive sync" "A sync is already running; you'll get a notification when it finishes."
     else
+        : >"$MANUAL_FLAG"
         systemctl --user start --no-block drive-sync.service
         notify "Drive sync" "Sync started" low
     fi
@@ -515,9 +700,75 @@ recent_runs() { # name
     printf '%s\n' "$rows" | rofi -dmenu -i -no-custom -p "$n runs" -mesg "Newest first (kept: 30 per remote)" >/dev/null
 }
 
+# One-time permission for the deletions the cap stopped: this remote, the next run, this count.
+allow_deletes() { # name [typed]
+    local n="$1" typed="${2:-}" interactive=0 count want sample tmp
+    count=$(status_get "$STATE_DIR/$n.status" delete_count)
+    if [ "$(status_get "$STATE_DIR/$n.status" state)" != delete-cap ] || [ "${count:-0}" -le 0 ] 2>/dev/null; then
+        echo "$n has no deletions waiting for permission" >&2
+        return 1
+    fi
+    want="DELETE $count"
+    if [ -z "$typed" ]; then
+        interactive=1
+        sample=$(head -n 20 "$STATE_DIR/$n.delete-sample" 2>/dev/null | esc)
+        typed=$(printf '%s\n' "$sample" | rofi -dmenu -i -p "Type: $want" -theme-str 'window {width: 50%;}' \
+            -mesg "$count local files are gone from $n and would be deleted from Drive too. One-time permission for the next run of $n only. A sample is listed below. Esc cancels.") || return 1
+    fi
+    if [ "$typed" != "$want" ]; then
+        echo "Not allowed: expected exactly '$want'" >&2
+        return 1
+    fi
+    tmp="$STATE_DIR/$n.delete-override.tmp"
+    (umask 077; printf 'approved_count=%s\ncreated_at=%s\n' "$count" "$(date +%s)" >"$tmp") && mv -f "$tmp" "$STATE_DIR/$n.delete-override"
+    [ "$interactive" -eq 1 ] && start_sync
+    return 0
+}
+
+# Terminal flow. The timer stays paused for the whole recovery so it cannot overlap, and comes
+# back however this ends. Input: the mode, then the typed confirmation. Filters are not touched.
+resync_flow() { # name
+    local n="$1" mode typed want="RESYNC $1"
+    if is_syncing; then
+        echo "A sync is running. Try again when it finishes."
+        return 1
+    fi
+    cat <<EOF
+Resync rebuilds the baseline of $n. It copies files both ways and deletes nothing, so files you
+deleted can come back, and renamed files can become duplicates. Files it overwrites locally are
+kept 14 days in the backup folder.
+
+  newer  the newest version of each file wins, on either side
+  path1  Drive is the source of truth: its version wins (best after a Google Doc error)
+
+This choice is yours. Nothing changes until you confirm after the preview.
+EOF
+    read -rp "Mode (newer or path1): " mode || return 1
+    case "$mode" in
+        newer|path1) ;;
+        *) echo "Unknown mode. Nothing done."; return 2 ;;
+    esac
+    systemctl --user stop drive-sync.timer
+    # shellcheck disable=SC2064 # expand now
+    trap "systemctl --user start drive-sync.timer" EXIT
+    trap 'exit 130' INT TERM HUP
+    if is_syncing; then
+        echo "A sync started just now. Try again when it finishes."
+        return 1
+    fi
+    echo "Timer paused. Previewing, this changes nothing..."
+    "$DRIVE_SYNC_BIN" --resync-preview --resync-mode "$mode" "$n" || { echo "Preview failed. Nothing done."; return 1; }
+    read -rp "Type '$want' to run it, anything else cancels: " typed || return 1
+    if [ "$typed" != "$want" ]; then
+        echo "Cancelled. Nothing changed."
+        return 1
+    fi
+    "$DRIVE_SYNC_BIN" --resync --resync-mode "$mode" --confirmed "$n"
+}
+
 click_menu() {
     if pgrep -x rofi >/dev/null 2>&1; then pkill -x rofi; return 0; fi
-    local choice remote confirm n rows="" mesg
+    local choice remote n rows="" mesg
     local sync_now="󰑐  Sync now"
     local check="󰍉  Check for pending changes (read-only Drive listing, 10 s - 2 min)"
     local verify="󰄬  Verify now (bisync dry-run, changes nothing)"
@@ -525,9 +776,17 @@ click_menu() {
     local open_folder="󰉋  Open Drive folder"
     local open_log="󰈙  Open full log"
     local resync="󰁯  Resync a remote…"
+    local failed_log="󰈙  Open a remote's last failed log"
+    local allow="󰆴  Allow stopped deletions once…"
     for n in "${NAMES[@]}"; do rows="$rows$(remote_line "$n" 1)"$'\n'; done
     mesg=$(header_mesg)
-    choice=$(printf '%s%s\n' "$rows" "$(printf '%s\n' "$sync_now" "$check" "$verify" "$details" "$open_folder" "$open_log" "$resync" | esc)" \
+    local items=("$sync_now" "$check" "$verify" "$details" "$open_folder" "$open_log" "$failed_log" "$resync")
+    local capped=()
+    for n in "${NAMES[@]}"; do
+        [ "$(status_get "$STATE_DIR/$n.status" state)" = delete-cap ] && capped+=("$n")
+    done
+    [ "${#capped[@]}" -gt 0 ] && items=("$allow" "${items[@]}")
+    choice=$(printf '%s%s\n' "$rows" "$(printf '%s\n' "${items[@]}" | esc)" \
         | rofi -dmenu -i -p "Drive" -markup-rows -mesg "$mesg" -no-custom -format 's' \
             -theme-str 'window {width: 50%;}') || exit 0
     # Strip markup from remote rows to find the remote name.
@@ -548,21 +807,36 @@ click_menu() {
             setsid -f thunar "$DRIVE_DIR" >/dev/null 2>&1 ;;
         "$open_log")
             term less +G "$LOGFILE" ;;
+        "$failed_log")
+            remote=$(pick_remote "Last failed log of") || exit 0
+            term less +G "$STATE_DIR/$remote.last-failed.log" ;;
+        "$allow")
+            remote=$(printf '%s\n' "${capped[@]}" | rofi -dmenu -i -p "Allow deletions on" -no-custom) || exit 0
+            if ! allow_deletes "$remote"; then
+                notify "Drive sync" "Not allowed: the text did not match. Nothing changed." low
+            fi ;;
         "$resync")
             remote=$(pick_remote "Resync which remote") || exit 0
-            confirm=$(printf '%s\n' "No" "Yes, resync $remote" | rofi -dmenu -i -no-custom \
-                -p "Confirm" -mesg "Resync rebuilds the baseline: union copy, newer file wins, nothing is deleted (deleted files may come back).") || exit 0
-            [ "$confirm" = "Yes, resync $remote" ] || exit 0
-            term bash -c "$HOME/.local/bin/drive-sync --resync '$remote'; echo; read -rp 'Press Enter to close' _" ;;
+            term bash -c "'$HOME/.local/bin/drive-sync-status' --resync-flow '$remote'; echo; read -rp 'Press Enter to close' _" ;;
     esac
 }
 
 known() { local n; for n in "${NAMES[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
 
 case "${1:-}" in
-    "") print_status 0 ;;
-    --tail) tail_loop ;;
-    --plain) print_status 1 ;;
+    "") print_status polybar ;;
+    --tail) tail_loop polybar ;;
+    --waybar) tail_loop json ;;
+    --json) print_status json ;;
+    --plain) print_status plain ;;
+    --sync-now) start_sync ;;
+    --allow-deletes)
+        known "${2:-}" || { echo "Usage: drive-sync-status --allow-deletes NAME [--typed TEXT]" >&2; exit 2; }
+        [ "${3:-}" = --typed ] && [ -z "${4:-}" ] && { echo "--typed needs text" >&2; exit 2; }
+        allow_deletes "$2" "${4:-}" || exit 1 ;;
+    --resync-flow)
+        known "${2:-}" || { echo "Usage: drive-sync-status --resync-flow NAME" >&2; exit 2; }
+        resync_flow "$2"; exit $? ;;
     --long) print_long ;;
     --click) click_menu ;;
     --pending)
@@ -578,5 +852,5 @@ case "${1:-}" in
     --details)
         known "${2:-}" || { echo "Usage: drive-sync-status --details NAME" >&2; exit 2; }
         details_view "$2" ;;
-    *) sed -n '2,31p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,33p' "$0" >&2; exit 2 ;;
 esac

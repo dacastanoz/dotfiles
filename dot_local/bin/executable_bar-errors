@@ -63,6 +63,8 @@ cmd_tail() { # cmd_tail <name> <cmd...>
     trap : USR1 USR2
     "$@" 2> >(trap : USR1 USR2; while IFS= read -r l; do log "$name" "$l"; done)
     rc=$?
+    # 141 = the bar closed its pipe, 143 = asked to stop: a bar restart, not a module failure.
+    case "$rc" in 0|141|143) return 0 ;; esac
     if [ "$rc" -ne 0 ]; then
         log "$name" "exited with code $rc"
         echo "$FALLBACK"

@@ -9,26 +9,53 @@
 # Usage:
 #   drive-sync [TARGET]            normal bisync (TARGET: all or a name from remotes.conf)
 #   drive-sync --dry-run [TARGET]  show what would change, touch nothing ("Verify now")
-#   drive-sync --force [TARGET]    bypass the --max-delete safety abort (after checking!)
-#   drive-sync --resync [TARGET]   rebuild bisync baseline (union copy, newer wins, no deletes)
+#   drive-sync --force [TARGET]    bypass the local delete cap and bisync's --max-delete abort
+#   drive-sync --resync-preview [--resync-mode M] NAME
+#                                  dry-run of a resync: changes nothing, not even the status
+#   drive-sync --resync [--resync-mode M] --confirmed NAME
+#                                  rebuild the baseline. Refused without --confirmed and always
+#                                  refused under the timer. Use the Drive menu, which previews,
+#                                  asks for typed confirmation and pauses the timer.
+#   drive-sync --post-stop         ExecStopPost hook: record a run the service manager killed
+#   drive-sync --classify-log FILE [RC]  print the failure class of a rclone log (no side effects)
 #
 # Behaviour:
-#   - Skips gracefully (exit 0, state=offline) when there is no network / airplane mode.
-#   - Skips timer runs when on battery below DRIVE_SYNC_MIN_BATTERY percent (default 10).
-#   - Never runs --resync on its own: when rclone says "Must run --resync" the remote is
-#     marked needs-resync and a desktop notification is sent. Use the polybar menu
-#     (drive-sync-status --click) or `drive-sync --resync <target>` to recover.
-#   - Per-remote status in ~/.local/state/drive-sync/<name>.status (read by drive-sync-status).
-#   - Full verbose log of the last run per remote: ~/.local/state/drive-sync/<name>.last.log
-#     (dry-runs: <name>.dryrun.log, result in <name>.verify).
-#   - Per-run evidence (counts + changed paths) as JSON: ~/.local/state/drive-sync/runs/
-#     (newest 30 per remote; <name>.last.json = latest, <name>.last-change.json = latest with changes).
+#   - NOTHING here ever runs --resync on its own.
+#   - Skips gracefully when there is no network or, for timer runs, when discharging below
+#     DRIVE_SYNC_MIN_BATTERY percent (default 20). Both are written as states, not failures.
+#   - Local delete cap: before any remote call, compares bisync's saved local listing with the
+#     local tree and stops that remote above min(100 files, 10 %), floor 20 files. It only sees
+#     LOCAL deletions. Deletions made on Drive are covered by --max-delete and the backup dir.
+#   - Per-remote state machine, see FAILURE MODEL below. Each remote has its own retry time.
+#   - The first remote rotates between runs, so one remote does not always spend quota first.
+#   - A watchdog kills a remote that makes no progress; a transfer that is moving is never killed.
+#   - Status per remote: ~/.local/state/drive-sync/<name>.status (read by drive-sync-status).
+#   - <name>.running exists while a remote syncs; if it outlives the run, the run died.
+#   - Logs: <name>.last.log (last run), <name>.last-failed.log (last failed run),
+#     <name>.dryrun.log, history.jsonl (one line per run per remote, no file names),
+#     runs/ (newest 30 per remote), ~/.local/share/rclone/bisync.log (rotated at 2 MiB).
 #   - Live progress while running: $XDG_RUNTIME_DIR/drive-sync/progress (key=value).
-#   - When $XDG_RUNTIME_DIR/drive-sync/notify-when-done exists (created by "Sync now"),
-#     a summary notification is shown at the end of the run.
-#   - Summary log: ~/.local/share/rclone/bisync.log (rotated at 2 MiB, one gzip generation).
 #   - Files overwritten/deleted locally by a sync are kept 14 days in
 #     ~/.local/share/drive-sync/backup/<name>/<date>/ (remote side uses Drive's trash).
+#
+# FAILURE MODEL
+#   class             automatic action                  notification
+#   offline           retry on schedule                 never
+#   network           backoff 10, 20, 40, 60 min        from the 3rd in a row
+#                     (timeouts or resets while the connectivity probe passes; if the probe
+#                     fails too, it counts as offline)
+#   rate-limited      backoff 10, 20, 40, 60 min        after 2 h of failures
+#   auth              retry; from the 2nd, hourly       critical from the 2nd
+#   interrupted       retry on schedule                 from the 3rd in a row
+#   locked            retry on schedule                 from the 3rd in a row
+#   hung              kill it, go on, retry             critical from the 2nd
+#   error             retry on schedule                 critical from the 2nd
+#   needs-resync      stop timer runs for this remote   critical
+#   gdoc-edit         stop timer runs for this remote   critical
+#   too-many-deletes  retry hourly                      critical
+#   access-check      retry hourly                      critical
+#   delete-cap        recheck locally every run         critical
+#   Manual runs ignore backoff and stops, never the delete cap.
 
 set -u
 export LC_ALL=C.UTF-8
@@ -42,12 +69,85 @@ NOTIFY_FLAG="$RUN_DIR/notify-when-done"
 LOGFILE="$HOME/.local/share/rclone/bisync.log"
 FILTERS="$HOME/.config/rclone/bisync-filters.txt"
 BACKUP_ROOT="$HOME/.local/share/drive-sync/backup"
+MANUAL_FLAG="$RUN_DIR/manual-request"
+HISTORY="$STATE_DIR/history.jsonl"
+HISTORY_MAX_BYTES="${DRIVE_SYNC_HISTORY_MAX_BYTES:-$((2 * 1024 * 1024))}"
+BISYNC_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/rclone/bisync"
 LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/drive-sync-${UID}.lock"
+LOCK_WAIT="${DRIVE_SYNC_LOCK_WAIT:-2}"
 LOG_MAX_BYTES=$((2 * 1024 * 1024))
+FAILED_LOG_MAX_BYTES=$((5 * 1024 * 1024))
 BACKUP_KEEP_DAYS=14
 RUNS_KEEP=30
 RENOTIFY_SECONDS=$((6 * 3600))
-MIN_BATTERY="${DRIVE_SYNC_MIN_BATTERY:-10}"
+MIN_BATTERY="${DRIVE_SYNC_MIN_BATTERY:-20}"
+POWER_DIR="${DRIVE_SYNC_POWER_DIR:-/sys/class/power_supply}"
+# bisync's --max-delete is a PERCENTAGE of files per side, not a count: a last-resort backstop
+# that also sees Drive-side deletions. The stricter, count-based limit is the local delete cap.
+MAX_DELETE_PERCENT=30
+DELETE_CAP_FILES=100
+DELETE_CAP_PERCENT=10
+DELETE_CAP_FLOOR=20
+OVERRIDE_TTL=$((24 * 3600))
+# Seconds with no new log line and no new byte count before a remote counts as hung. Above the
+# longest normal listings seen on the largest remote (p95 of a whole run: 233 s, slowest about 14 min).
+# Counted in poll ticks, so time the machine spends suspended does not count.
+WATCHDOG_SECONDS="${DRIVE_SYNC_WATCHDOG_SECONDS:-1200}"
+KILL_GRACE="${DRIVE_SYNC_KILL_GRACE:-30}"
+STALE_NOTIFY_SECONDS=$((6 * 3600))
+CLIENT_NOTIFY_SECONDS=86400
+# shellcheck disable=SC2088 # shown to the user as text
+OAUTH_GUIDE="~/.local/share/chezmoi/docs/drive-sync-oauth-client.md"
+
+# --- failure classifier -----------------------------------------------------------
+# Decides on the lines that report the failure, never on retried low-level noise and never
+# on a tail of the log (the real error can be anywhere).
+classify_text() { # text -> class
+    local t="$1"
+    grep_i() { printf '%s\n' "$t" | rg -qi "$1"; }
+    if grep_i 'prior lock file'; then echo locked
+    elif grep_i 'too many deletes|safety abort'; then echo too-many-deletes
+    elif grep_i 'check file check failed|access test failed|cannot sync to an empty directory'; then echo access-check
+    elif grep_i 'must run --resync|cannot find prior path'; then echo needs-resync
+    elif grep_i 'storageQuotaExceeded'; then echo error # Drive is full: backing off would not help
+    elif grep_i 'quota exceeded|quotaExceeded|rateLimitExceeded|userRateLimit|sharingRateLimit|error 429|code 429'; then echo rate-limited
+    elif grep_i 'network is unreachable|no such host|name resolution'; then echo offline
+    elif grep_i 'i/o timeout|connection refused|connection reset|TLS handshake timeout|dial tcp|context deadline exceeded'; then echo network
+    elif grep_i 'invalid_grant|invalid_client|unauthorized_client|deleted_client|disabled_client|fetch token|token expired|error 401|401 unauthorized|invalid authentication|access_denied'; then echo auth
+    else echo error
+    fi
+}
+
+classify_log() { # file [rc] -> class
+    local log="$1" rc="${2:-1}" focus class
+    [ "$rc" -ge 128 ] && { echo interrupted; return; }
+    if rg -qi "can.t update google document type" "$log"; then echo gdoc-edit; return; fi
+    focus=$(rg -i 'critical error|failed to bisync|safety abort|access test failed|must run --resync' "$log")
+    class=$(classify_text "$focus")
+    if [ "$class" = error ]; then
+        focus=$(rg ' ERROR : ' "$log")
+        class=$(classify_text "$focus")
+    fi
+    echo "$class"
+}
+
+# The line that says what went wrong, without its timestamp. For the local status only:
+# it can hold a file name, so it never goes into a notification or the summary log.
+error_detail() { # file
+    local log="$1" line
+    line=$(rg -i "can.t update google document type" "$log" | head -n 1)
+    [ -n "$line" ] || line=$(rg 'Bisync critical error' "$log" | rg -v 'bisync run had errors' | tail -n 1)
+    [ -n "$line" ] || line=$(rg ' ERROR : ' "$log" | rg -v 'Bisync aborted|There were errors|bisync run had errors' | head -n 1)
+    [ -n "$line" ] || line=$(rg 'Failed to bisync|prior lock' "$log" | tail -n 1)
+    line="${line#*ERROR : }"
+    line="${line#*NOTICE: }"
+    printf '%s' "${line:0:400}"
+}
+
+if [ "${1:-}" = --classify-log ]; then
+    classify_log "${2:?log file}" "${3:-1}"
+    exit 0
+fi
 
 REMOTES_CONF="${DRIVE_SYNC_REMOTES:-${XDG_CONFIG_HOME:-$HOME/.config}/drive-sync/remotes.conf}"
 
@@ -78,14 +178,25 @@ known_target() { # name -> 0 if it is configured
 
 MODE=normal
 TARGET=all
+RESYNC_MODE=newer
+CONFIRMED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) MODE=dry-run ;;
         --force) MODE=force ;;
         --resync) MODE=resync ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        --resync-preview) MODE=resync-preview ;;
+        --post-stop) MODE=post-stop ;;
+        --confirmed) CONFIRMED=1 ;;
+        --resync-mode)
+            shift
+            case "${1:-}" in
+                path1|path2|newer|older|larger|smaller) RESYNC_MODE=$1 ;;
+                *) echo "drive-sync: invalid --resync-mode '${1:-}'" >&2; exit 2 ;;
+            esac ;;
+        -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
         all) TARGET=all ;;
-        -*) echo "Usage: drive-sync [--dry-run|--force|--resync] [all|NAME]" >&2; exit 2 ;;
+        -*) echo "Usage: drive-sync [--dry-run|--force|--resync-preview|--resync --confirmed] [all|NAME]" >&2; exit 2 ;;
         *)
             if known_target "$1"; then TARGET=$1
             else echo "drive-sync: unknown remote '$1' (see $REMOTES_CONF)" >&2; exit 2; fi ;;
@@ -93,12 +204,39 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+if [ "$MODE" = resync ]; then
+    if [ -n "${DRIVE_SYNC_TIMER:-}" ]; then
+        echo "drive-sync: refusing --resync from a timer run" >&2; exit 2
+    fi
+    if [ "$CONFIRMED" -ne 1 ]; then
+        echo "drive-sync: --resync needs --confirmed. Use 'Resync a remote' in the Drive menu: it previews first." >&2; exit 2
+    fi
+fi
+if { [ "$MODE" = resync ] || [ "$MODE" = resync-preview ]; } && [ "$TARGET" = all ]; then
+    echo "drive-sync: resync works on one named remote" >&2; exit 2
+fi
+
 mkdir -p "$STATE_DIR" "$RUNS_DIR" "$RUN_DIR" "$(dirname "$LOGFILE")" "$BACKUP_ROOT"
 
 exec 9>"$LOCKFILE"
-if ! flock -n 9; then
+if [ "$MODE" = post-stop ]; then
+    # A live run keeps the lock: its .running files are not dead.
+    flock -n 9 || exit 0
+elif ! flock -w "$LOCK_WAIT" 9; then # short wait: drive-sync-status takes this lock for an instant
     echo "[$(date '+%F %T')] Sync already in progress; skipping this run"
+    # A resync or its preview did not happen, and whoever asked has to know.
+    case "$MODE" in
+        resync|resync-preview) echo "drive-sync: a sync is running, so $MODE did not run" >&2; exit 1 ;;
+    esac
     exit 0
+fi
+
+TRIGGER=manual
+[ -n "${DRIVE_SYNC_TIMER:-}" ] && TRIGGER=timer
+if [ -e "$MANUAL_FLAG" ] && [ "$MODE" != post-stop ]; then
+    # "Sync now" starts the same service as the timer. Old flags (service was busy) do not count.
+    [ $(( $(date +%s) - $(stat -c %Y "$MANUAL_FLAG") )) -lt 300 ] && TRIGGER=manual
+    rm -f "$MANUAL_FLAG"
 fi
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOGFILE"; }
@@ -111,8 +249,8 @@ notify() { # urgency title body
     notify-send -a "Drive sync" -u "$1" -i folder-cloud "$2" "$3" 2>/dev/null || true
 }
 
-# Wake the polybar tail (drive-sync-status --tail) so it redraws right away.
-refresh_bar() { pkill -USR1 -f '^[^ ]*bash [^ ]*/drive-sync-status --tail$' 2>/dev/null || true; }
+# Wake the bar process (drive-sync-status --waybar or --tail) so it redraws right away.
+refresh_bar() { pkill -USR1 -f '^[^ ]*bash [^ ]*/drive-sync-status --(tail|waybar)$' 2>/dev/null || true; }
 
 rotate_log() {
     local size
@@ -136,21 +274,66 @@ status_get() { # file key
     done <"$1"
 }
 
-# Write status atomically. Keeps last_ok / notified_* unless overridden.
-write_status() { # name state message [last_ok]
-    local file="$STATE_DIR/$1.status" now last_ok notified_state notified_at
-    now=$(date +%s)
-    last_ok="${4:-$(status_get "$file" last_ok)}"
-    notified_state=$(status_get "$file" notified_state)
-    notified_at=$(status_get "$file" notified_at)
-    {
-        echo "state=$2"
-        echo "message=${3//$'\n'/ }"
-        echo "last_run=$now"
-        echo "last_ok=${last_ok:-0}"
-        echo "notified_state=${notified_state}"
-        echo "notified_at=${notified_at:-0}"
-    } >"$file.tmp" && mv -f "$file.tmp" "$file"
+# Update keys of a status file atomically, keeping every other key. Files from older versions
+# just lack the newer keys, and readers default those.
+status_set() { # name key=value...
+    local file="$STATE_DIR/$1.status" line k kv
+    local -A vals=()
+    local order=()
+    shift
+    if [ -f "$file" ]; then
+        while IFS= read -r line; do
+            k=${line%%=*}
+            [ -n "$k" ] && [ "$line" != "$k" ] || continue
+            [ -v "vals[$k]" ] || order+=("$k")
+            vals[$k]=${line#*=}
+        done <"$file"
+    fi
+    for kv in "$@"; do
+        k=${kv%%=*}
+        [ -v "vals[$k]" ] || order+=("$k")
+        line=${kv#*=}
+        vals[$k]=${line//$'\n'/ }
+    done
+    for k in "${order[@]}"; do printf '%s=%s\n' "$k" "${vals[$k]}"; done >"$file.tmp" && mv -f "$file.tmp" "$file"
+}
+
+sget() { status_get "$STATE_DIR/$1.status" "$2"; } # name key
+
+remote_of() { # name -> rclone remote
+    local entry
+    for entry in "${REMOTES[@]}"; do
+        [ "${entry%%|*}" = "$1" ] || continue
+        entry=${entry#*|}
+        printf '%s' "${entry%%|*}"
+        return 0
+    done
+}
+
+# States a skip must not overwrite: they need someone, and hiding them would lie.
+is_blocking() { # state
+    case "$1" in needs-resync|gdoc-edit|auth|too-many-deletes|access-check|delete-cap) return 0 ;; esac
+    return 1
+}
+
+write_skip_state() { # name state message
+    is_blocking "$(sget "$1" state)" && return 0
+    status_set "$1" "state=$2" "message=$3" "last_run=$(date +%s)"
+}
+
+# Timer runs leave this remote alone for now? Prints why.
+timer_should_skip() { # name
+    local st next
+    st=$(sget "$1" state)
+    next=$(sget "$1" next_attempt)
+    case "$st" in
+        needs-resync|gdoc-edit) echo "stopped ($st), waiting for you"; return 0 ;;
+    esac
+    if [ "${next:-0}" -gt "$(date +%s)" ] 2>/dev/null; then
+        echo "retry at $(date -d "@$next" +%H:%M)"
+        return 0
+    fi
+    return 1
 }
 
 # Remote-side pending changes (Drive -> local) with the time they were measured.
@@ -162,21 +345,223 @@ write_remote_pending() { # name new modified deleted source
 
 # Notify only on state transitions, or again after RENOTIFY_SECONDS.
 notify_once() { # name state urgency title body
-    local file="$STATE_DIR/$1.status" prev_state prev_at now
-    prev_state=$(status_get "$file" notified_state)
-    prev_at=$(status_get "$file" notified_at)
+    local prev_state prev_at now
+    prev_state=$(sget "$1" notified_state)
+    prev_at=$(sget "$1" notified_at)
     now=$(date +%s)
     if [ "$prev_state" != "$2" ] || [ $((now - ${prev_at:-0})) -gt "$RENOTIFY_SECONDS" ]; then
         notify "$3" "$4" "$5"
-        sd '^notified_state=.*$' "notified_state=$2" "$file" 2>/dev/null
-        sd '^notified_at=.*$' "notified_at=$now" "$file" 2>/dev/null
+        status_set "$1" "notified_state=$2" "notified_at=$now"
     fi
 }
 
-clear_notified() { # name
-    local file="$STATE_DIR/$1.status"
-    [ -f "$file" ] || return 0
-    sd '^notified_state=.*$' 'notified_state=' "$file" 2>/dev/null
+# The notification column of the failure model. Bodies never hold file names.
+notify_policy() { # name state message
+    local name="$1" state="$2" msg="$3" streak first now
+    streak=$(sget "$name" streak)
+    streak=${streak:-1}
+    first=$(sget "$name" first_fail_at)
+    now=$(date +%s)
+    case "$state" in
+        needs-resync|gdoc-edit|too-many-deletes|delete-cap|access-check)
+            notify_once "$name" "$state" critical "Drive sync: $name needs you" "$msg" ;;
+        auth|hung|error)
+            [ "$streak" -ge 2 ] && notify_once "$name" "$state" critical "Drive sync failed: $name" "$msg" ;;
+        rate-limited)
+            [ $((now - ${first:-$now})) -ge 7200 ] && notify_once "$name" "$state" normal "Drive sync: $name rate limited for 2 h" "$msg" ;;
+        interrupted|locked)
+            [ "$streak" -ge 3 ] && notify_once "$name" "$state" normal "Drive sync: $name keeps getting interrupted" "$msg" ;;
+        network)
+            [ "$streak" -ge 3 ] && notify_once "$name" "$state" normal "Drive sync: $name keeps timing out" "$msg" ;;
+    esac
+    return 0
+}
+
+# Advance the per-remote state machine after a failed attempt.
+record_failure() { # name state message [detail]
+    local name="$1" state="$2" msg="$3" detail="${4:-}" now prev streak first next=0 minutes
+    now=$(date +%s)
+    if [ "$state" = offline ]; then
+        status_set "$name" state=offline "message=$msg" "detail=$detail" "last_run=$now"
+        return 0
+    fi
+    prev=$(sget "$name" fail_class)
+    streak=$(sget "$name" streak)
+    first=$(sget "$name" first_fail_at)
+    if [ "$prev" = "$state" ] && [ "${streak:-0}" -gt 0 ] 2>/dev/null; then
+        streak=$((streak + 1))
+    else
+        streak=1
+        first=$now
+    fi
+    case "$state" in
+        rate-limited|network)
+            case "$streak" in 1) minutes=10 ;; 2) minutes=20 ;; 3) minutes=40 ;; *) minutes=60 ;; esac
+            next=$((now + minutes * 60)) ;;
+        auth) [ "$streak" -ge 2 ] && next=$((now + 3600)) ;;
+        too-many-deletes|access-check) next=$((now + 3600)) ;;
+    esac
+    status_set "$name" "state=$state" "message=$msg" "detail=$detail" "last_run=$now" \
+        "fail_class=$state" "streak=$streak" "first_fail_at=$first" "next_attempt=$next"
+    notify_policy "$name" "$state" "$msg"
+}
+
+record_success() { # name duration summary duplicates
+    local now
+    now=$(date +%s)
+    status_set "$1" state=ok message=Synced detail= "last_run=$now" "last_ok=$now" streak=0 fail_class= \
+        first_fail_at=0 next_attempt=0 notified_state= delete_count=0 \
+        "last_duration=$2" "last_summary=$3" "duplicates=${4:-0}"
+}
+
+# --- run history -------------------------------------------------------------------
+history_append() { # json line (no file names)
+    local size
+    printf '%s\n' "$1" >>"$HISTORY"
+    size=$(stat -c %s "$HISTORY" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$HISTORY_MAX_BYTES" ]; then
+        tail -c $((HISTORY_MAX_BYTES / 2)) "$HISTORY" | tail -n +2 >"$HISTORY.tmp" && mv -f "$HISTORY.tmp" "$HISTORY"
+    fi
+}
+
+history_event() { # name result reason started ended
+    local line
+    line=$(jq -nc --arg name "$1" --arg result "$2" --arg reason "$3" --arg mode "$MODE" --arg trigger "$TRIGGER" \
+        --argjson started "${4:-0}" --argjson ended "${5:-0}" \
+        '{name: $name, mode: $mode, trigger: $trigger, result: $result, reason: $reason, started: $started, ended: $ended, duration: ($ended - $started)}') || return 0
+    history_append "$line"
+}
+
+# --- dead runs ---------------------------------------------------------------------
+read_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+mark_running() { # name started
+    local boot
+    boot=$(read_boot_id)
+    printf 'started=%s\npid=%s\nboot_id=%s\nmode=%s\ntrigger=%s\n' "$2" "$$" "$boot" "$MODE" "$TRIGGER" \
+        >"$STATE_DIR/$1.running.tmp" && mv -f "$STATE_DIR/$1.running.tmp" "$STATE_DIR/$1.running"
+}
+
+record_interrupted() { # name reason
+    local file="$STATE_DIR/$1.running" started
+    started=$(status_get "$file" started)
+    record_failure "$1" interrupted "$2"
+    history_event "$1" interrupted "$2" "${started:-0}" "$(date +%s)"
+    rm -f "$file"
+}
+
+# We hold the lock, so any .running file left is a run that died without a word.
+detect_dead_runs() {
+    local entry name file boot this_boot reason
+    this_boot=$(read_boot_id)
+    for entry in "${REMOTES[@]}"; do
+        name=${entry%%|*}
+        file="$STATE_DIR/$name.running"
+        [ -f "$file" ] || continue
+        boot=$(status_get "$file" boot_id)
+        if [ "$boot" != "$this_boot" ]; then reason="Machine restarted during the sync; retrying"
+        else reason="The sync process died; retrying"; fi
+        log "⚠ $name: previous run did not finish"
+        record_interrupted "$name" "$reason"
+    done
+}
+
+post_stop() {
+    local entry name reason
+    case "${SERVICE_RESULT:-}" in
+        success|"") reason="" ;;
+        oom-kill) reason="Killed by the kernel: out of memory; retrying" ;;
+        timeout) reason="Stopped by the service time limit; retrying" ;;
+        signal|core-dump) reason="Killed by signal ${EXIT_STATUS:-?}; retrying" ;;
+        *) reason="The sync script stopped unexpectedly (${SERVICE_RESULT}, ${EXIT_STATUS:-?}); retrying" ;;
+    esac
+    for entry in "${REMOTES[@]}"; do
+        name=${entry%%|*}
+        [ -f "$STATE_DIR/$name.running" ] || continue
+        log "⚠ $name: run ended by the service manager (${SERVICE_RESULT:-unknown})"
+        record_interrupted "$name" "${reason:-The sync process died; retrying}"
+    done
+    rm -f "$PROGRESS" "$PROGRESS.tmp"
+    refresh_bar
+}
+
+# --- local delete cap --------------------------------------------------------------
+listing_file() { # local_dir -> path of bisync's saved local listing
+    local dir="$1" key f
+    # rclone's CanonicalPath: trim slashes, then whitespace and \ / : ? * become _
+    key="${dir#/}"; key="${key%/}"; key="${key//[[:space:]\\\/:?*]/_}"
+    for f in "$BISYNC_CACHE"/*.."$key".path2.lst; do
+        [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+# Paths in the saved listing that are gone from disk. Writes them to OUT, prints "gone total".
+count_local_deletions() { # local_dir listing out
+    awk -v out="$3" '
+        function lst_path(line,   p) {
+            p = substr(line, index(line, "\"") + 1); sub(/"$/, "", p)
+            gsub(/\\"/, "\"", p); gsub(/\\\\/, "\\", p)
+            return p
+        }
+        FILENAME == ARGV[1] { if (substr($0, 1, 2) == "- ") { t++; listed[lst_path($0)] = 1 } next }
+        { delete listed[$0] }
+        END {
+            n = 0
+            for (p in listed) { n++; print p > out }
+            close(out)
+            printf "%d %d\n", n, t
+        }' "$2" <(cd "$1" && fd -H -t f --no-ignore --strip-cwd-prefix . 2>/dev/null) 2>/dev/null
+}
+
+delete_limit() { # total -> allowed deletions
+    local total="$1" limit
+    limit=$((total * DELETE_CAP_PERCENT / 100))
+    [ "$limit" -gt "$DELETE_CAP_FILES" ] && limit=$DELETE_CAP_FILES
+    [ "$limit" -lt "$DELETE_CAP_FLOOR" ] && limit=$DELETE_CAP_FLOOR
+    echo "$limit"
+}
+
+# 0 = the one-time override covers these deletions. Any other use voids the override.
+override_allows() { # name count
+    local file="$STATE_DIR/$1.delete-override" approved created
+    [ -f "$file" ] || return 1
+    approved=$(status_get "$file" approved_count)
+    created=$(status_get "$file" created_at)
+    if [ "${approved:-0}" -ge "$2" ] 2>/dev/null && [ $(( $(date +%s) - ${created:-0} )) -lt "$OVERRIDE_TTL" ] 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$file"
+    return 1
+}
+
+declare -A DELETE_BLOCKED=()
+
+delete_precheck() { # name local_dir. No remote calls.
+    local name="$1" dir="$2" lst out count total limit msg now
+    [ -d "$dir" ] || return 0
+    lst=$(listing_file "$dir") || return 0
+    out=$(umask 077; mktemp "$RUN_DIR/$name.gone.XXXXXX") || return 0
+    read -r count total < <(count_local_deletions "$dir" "$lst" "$out")
+    limit=$(delete_limit "${total:-0}")
+    if [ "${count:-0}" -le "$limit" ] || override_allows "$name" "$count"; then
+        rm -f "$out"
+        if [ "$(sget "$name" state)" = delete-cap ]; then
+            status_set "$name" state=pending "message=Delete limit cleared; waiting for the next sync" delete_count=0 \
+                fail_class= streak=0 first_fail_at=0 next_attempt=0
+        fi
+        return 0
+    fi
+    now=$(date +%s)
+    (umask 077; sort "$out" | head -n 50 >"$STATE_DIR/$name.delete-sample")
+    rm -f "$out"
+    msg="$count local files are gone from $name (limit $limit of $total). Nothing was synced. Restore them, or allow it once from the Drive menu."
+    status_set "$name" "delete_count=$count" "delete_limit=$limit"
+    record_failure "$name" delete-cap "$msg"
+    history_event "$name" delete-cap "$count of $total local files gone" "$now" "$now"
+    log "✗ $name: $count local deletions above the limit of $limit; not syncing"
+    DELETE_BLOCKED[$name]=1
+    SUMMARY+=("✗ $name: $count local deletions, limit $limit")
 }
 
 is_online() {
@@ -193,7 +578,7 @@ is_online() {
 
 battery_too_low() {
     local bat status cap
-    for bat in /sys/class/power_supply/BAT*; do
+    for bat in "$POWER_DIR"/BAT*; do
         [ -r "$bat/status" ] || continue
         status=$(<"$bat/status")
         cap=$(<"$bat/capacity")
@@ -211,6 +596,7 @@ list_conflicts() { # local_dir
 # (--stats 1s --stats-one-line), file counts from queued vs copied lines.
 # shellcheck disable=SC2016 # awk program, not shell
 PROGRESS_AWK='
+!/NOTICE: +[0-9.]+ ?[KMGTPE]?i?B \/ / && !/lock file renewed/ { act++ }
 /Building Path1 and Path2 listings/ { ph = "listing" }
 /Path[12] checking for diffs/       { ph = "comparing" }
 /Applying changes/                  { ph = "applying" }
@@ -226,13 +612,15 @@ PROGRESS_AWK='
 END {
     sub(/%$/, "", pct); if (pct == "-") pct = ""
     if (bt ~ /^0 ?B$/) pct = ""
-    printf "%s|%s|%s|%s|%s|%s|%d|%d\n", ph, pct, bd, bt, sp, eta, q, c
+    printf "%s|%s|%s|%s|%s|%s|%d|%d|%d\n", ph, pct, bd, bt, sp, eta, q, c, act
 }'
 
 write_progress() { # name index total runlog started
-    local phase pct bdone btotal speed eta queued copied
-    IFS='|' read -r phase pct bdone btotal speed eta queued copied \
+    local phase pct bdone btotal speed eta queued copied activity
+    IFS='|' read -r phase pct bdone btotal speed eta queued copied activity \
         < <(awk "$PROGRESS_AWK" "$4" 2>/dev/null)
+    # What the watchdog watches: new log lines (not stats or lock renewals) or new bytes.
+    PROGRESS_MARK="$activity|$bdone"
     {
         printf 'remote=%s\nindex=%s\ntotal=%s\nmode=%s\n' "$1" "$2" "$3" "$MODE"
         printf 'phase=%s\npercent=%s\nbytes_done=%s\nbytes_total=%s\n' "${phase:-starting}" "$pct" "$bdone" "$btotal"
@@ -297,6 +685,7 @@ record_run() { # name remote local_dir runlog rc state started ended
     [ -n "$json" ] || return 0
     file="$RUNS_DIR/$(date -d "@$started" +%Y%m%d-%H%M%S)-$name.json"
     printf '%s\n' "$json" >"$file"
+    history_append "$(jq -c --arg trigger "$TRIGGER" 'del(.changes) + {trigger: $trigger}' <<<"$json")"
     cp -f "$file" "$STATE_DIR/$name.last.json"
     if [ "$(jq '.counts.down + .counts.up + .counts.deleted_local + .counts.deleted_drive + .counts.conflicts' <<<"$json")" -gt 0 ]; then
         cp -f "$file" "$STATE_DIR/$name.last-change.json"
@@ -321,31 +710,59 @@ change_counts() { # "summary string"
 }
 
 RCLONE_PID=""
+CURRENT_REMOTE=""
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
     [ -n "$RCLONE_PID" ] && kill "$RCLONE_PID" 2>/dev/null
+    if [ -n "$CURRENT_REMOTE" ]; then
+        log "⚠ $CURRENT_REMOTE: stopped while syncing"
+        record_interrupted "$CURRENT_REMOTE" "Stopped while syncing (shutdown or service stop); retrying"
+    fi
     rm -f "$PROGRESS" "$PROGRESS.tmp"
     refresh_bar
 }
-trap cleanup EXIT
-trap 'exit 143' TERM INT HUP
 
 SUMMARY=()   # per-remote lines for the "Sync now" notification
+
+keep_failed_log() { # runlog name
+    rg -v 'NOTICE: +[0-9.]+ ?[KMGTPE]?i?B / |lock file renewed' "$1" | tail -c "$FAILED_LOG_MAX_BYTES" \
+        >"$STATE_DIR/$2.last-failed.log.tmp" && mv -f "$STATE_DIR/$2.last-failed.log.tmp" "$STATE_DIR/$2.last-failed.log"
+}
+
+failure_message() { # state remote rc name
+    case "$1" in
+        needs-resync) echo "Bisync baseline lost. Pause, review, then use 'Resync a remote' in the Drive menu." ;;
+        gdoc-edit) echo "A local copy of a Google Doc was edited, which Drive refuses. Make the edit in the browser and put the local copy back, then use 'Resync a remote' in the Drive menu." ;;
+        too-many-deletes) echo "Over ${MAX_DELETE_PERCENT}% of the files would be deleted; aborted for safety. Check, then run: drive-sync --force $4" ;;
+        access-check) echo "RCLONE_TEST check file is missing on one side, or a side is empty; aborted for safety. Check that the folder and Drive are intact." ;;
+        auth) echo "Google auth failed. Run: rclone config reconnect $2" ;;
+        offline) echo "Network dropped during sync; will retry." ;;
+        network) echo "Timeouts or dropped connections talking to Google, though the network is up; backing off." ;;
+        rate-limited) echo "Google API quota hit; backing off." ;;
+        locked) echo "Stale bisync lock from a killed run; expires by itself." ;;
+        interrupted) echo "Stopped before finishing (exit $3); will retry." ;;
+        hung) echo "No progress for $((WATCHDOG_SECONDS / 60)) min; stopped it and will retry." ;;
+        *) echo "rclone failed (exit $3). See the last failed log in the Drive menu." ;;
+    esac
+}
 
 sync_remote() { # name remote local_dir index total
     local name="$1" remote="$2" local_dir="$3" index="$4" total="$5"
     local runlog="$STATE_DIR/$name.last.log" backup_dir rc before after new_conflicts started ended human
+    local mark="" idle=0 hung=0 kill_at=0 duplicates
     backup_dir="$BACKUP_ROOT/$name/$(date +%F)"
-    [ "$MODE" = dry-run ] && runlog="$STATE_DIR/$name.dryrun.log"
+    case "$MODE" in dry-run|resync-preview) runlog="$STATE_DIR/$name.dryrun.log" ;; esac
 
     if [ ! -d "$local_dir" ]; then
-        write_status "$name" error "Local folder missing: $local_dir"
+        record_failure "$name" error "Local folder missing: $local_dir"
         notify_once "$name" error critical "Drive sync: $name" "Local folder missing: $local_dir"
         log "✗ $name: local folder missing ($local_dir)"
         SUMMARY+=("✗ $name: local folder missing")
         return 1
     fi
 
+    # Google Docs stay synced. Do NOT add --drive-skip-gdocs: a July dry-run showed bisync then
+    # treats the local .docx copies as new and uploads them as duplicates next to the real Docs.
     local args=(
         "$remote" "$local_dir"
         --filters-file "$FILTERS"
@@ -355,7 +772,7 @@ sync_remote() { # name remote local_dir index total
         --resilient
         --recover
         --max-lock 2m
-        --max-delete 30
+        --max-delete "$MAX_DELETE_PERCENT"
         --retries 3 --retries-sleep 10s
         --low-level-retries 10
         --contimeout 30s --timeout 5m
@@ -366,7 +783,8 @@ sync_remote() { # name remote local_dir index total
     case "$MODE" in
         dry-run) args+=(--dry-run) ;;
         force) args+=(--force --backup-dir2 "$backup_dir") ;;
-        resync) args+=(--resync --resync-mode newer) ;;
+        resync) args+=(--resync --resync-mode "$RESYNC_MODE" --backup-dir2 "$backup_dir") ;;
+        resync-preview) args+=(--resync --resync-mode "$RESYNC_MODE" --dry-run) ;;
         normal) args+=(--backup-dir2 "$backup_dir") ;;
     esac
 
@@ -374,26 +792,54 @@ sync_remote() { # name remote local_dir index total
     before=$(list_conflicts "$local_dir")
     started=$(date +%s)
     : >"$runlog"
+    case "$MODE" in
+        normal|force|resync)
+            rm -f "$STATE_DIR/$name.delete-override"   # one-time: spent by this run
+            mark_running "$name" "$started"
+            CURRENT_REMOTE=$name ;;
+    esac
     write_progress "$name" "$index" "$total" "$runlog" "$started"
     refresh_bar
     rclone bisync "${args[@]}" >"$runlog" 2>&1 &
     RCLONE_PID=$!
     while kill -0 "$RCLONE_PID" 2>/dev/null; do
         write_progress "$name" "$index" "$total" "$runlog" "$started"
+        if [ "$PROGRESS_MARK" != "$mark" ]; then
+            mark=$PROGRESS_MARK
+            idle=0
+        else
+            idle=$((idle + 1))
+        fi
+        if [ "$hung" -eq 0 ] && [ "$idle" -ge "$WATCHDOG_SECONDS" ]; then
+            hung=1
+            kill_at=$((idle + KILL_GRACE))
+            log "✗ $name: no progress for ${WATCHDOG_SECONDS}s; stopping it"
+            kill "$RCLONE_PID" 2>/dev/null
+        elif [ "$hung" -eq 1 ] && [ "$idle" -ge "$kill_at" ]; then
+            kill -KILL "$RCLONE_PID" 2>/dev/null
+        fi
         sleep 1
     done
     wait "$RCLONE_PID"
     rc=$?
     RCLONE_PID=""
     ended=$(date +%s)
-    # Keep errors/notices in the long-lived log (not the per-second stats lines).
+    duplicates=$(rg -c 'Duplicate object found' "$runlog" || true)
+    # Keep errors/notices in the long-lived log (not stats lines or per-run duplicate notices).
     rg -N '(ERROR|NOTICE)' "$runlog" \
-        | rg -v 'shared Google Drive client_id|NOTICE: +[0-9.]+ ?[KMGTPE]?i?B / ' | tail -n 40 >>"$LOGFILE"
-    # rclone's shared OAuth client is rate limited and being retired: remember it for the menu.
+        | rg -v 'shared Google Drive client_id|Duplicate object found|NOTICE: +[0-9.]+ ?[KMGTPE]?i?B / ' | tail -n 200 >>"$LOGFILE"
+    # rclone's shared OAuth client is rate limited and being retired. rclone prints this notice
+    # on every run that uses it, so its absence from a finished run means the remote moved off it.
     if rg -q 'shared Google Drive client_id' "$runlog"; then
         : >"$STATE_DIR/$name.shared-client-id"
-    else
+    elif [ "$rc" -eq 0 ]; then
         rm -f "$STATE_DIR/$name.shared-client-id"
+    fi
+
+    if [ "$MODE" = resync-preview ]; then
+        echo "Would copy or update: $(rg -c 'Skipped (copy|update)' "$runlog" || echo 0) file(s). Full preview: $runlog"
+        log "resync preview $name finished (exit $rc)"
+        return "$rc"
     fi
 
     if [ "$MODE" = dry-run ]; then
@@ -419,14 +865,16 @@ sync_remote() { # name remote local_dir index total
         return "$rc"
     fi
 
-    if [ "$rc" -eq 0 ]; then
+    CURRENT_REMOTE=""
+    rm -f "$STATE_DIR/$name.running"
+
+    if [ "$rc" -eq 0 ] && [ "$hung" -eq 0 ]; then
         after=$(list_conflicts "$local_dir")
         new_conflicts=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | rg -c . || true)
-        write_status "$name" ok "Synced" "$(date +%s)"
-        clear_notified "$name"
         write_remote_pending "$name" 0 0 0 sync
         rm -f "$RUN_DIR/$name.local"   # local pending cache
         human=$(record_run "$name" "$remote" "$local_dir" "$runlog" "$rc" ok "$started" "$ended")
+        record_success "$name" "$((ended - started))" "${human:-no summary}" "${duplicates:-0}"
         if [ "${new_conflicts:-0}" -gt 0 ]; then
             notify normal "Drive sync: $name conflicts" \
                 "$new_conflicts file(s) changed on both sides. Newer kept; older renamed *.conflictN in $local_dir"
@@ -438,44 +886,52 @@ sync_remote() { # name remote local_dir index total
     fi
 
     # Classify the failure.
-    local state=error urgency=critical msg
-    if rg -qi 'must run --resync' "$runlog"; then
-        state=needs-resync
-        msg="Bisync baseline lost. Review, then use 'Resync' in the Drive menu."
-    elif rg -qi 'too many deletes|safety abort' "$runlog"; then
-        state=too-many-deletes
-        msg="Too many deletions detected; aborted for safety. Check, then run: drive-sync --force $name"
-    elif rg -qi 'invalid_grant|couldn.t fetch token|token expired|oauth2|unauthorized_client|401 Unauthorized' "$runlog"; then
-        state=auth
-        msg="Google auth expired. Run: rclone config reconnect $remote"
-    elif rg -qi 'network is unreachable|no such host|i/o timeout|connection refused|connection reset|TLS handshake timeout|dial tcp' "$runlog"; then
-        state=offline
-        urgency=low
-        msg="Network dropped during sync; will retry."
-    elif rg -qi 'rateLimitExceeded|userRateLimitExceeded|code 429|quotaExceeded' "$runlog"; then
-        state=rate-limited
-        urgency=low
-        msg="Google API rate limit; will retry next run."
-    elif rg -qi 'prior lock file found' "$runlog"; then
-        state=locked
-        urgency=low
-        msg="Stale bisync lock; expires automatically (--max-lock 2m)."
-    else
-        msg="$(rg -i 'error' "$runlog" | tail -n 1 | cut -c1-160)"
-        [ -n "$msg" ] || msg="rclone exit $rc"
-    fi
-    write_status "$name" "$state" "$msg"
+    local state msg
+    if [ "$hung" -eq 1 ]; then state=hung; else state=$(classify_log "$runlog" "$rc"); fi
+    # Timeouts while Google answers the probe are a problem to surface; without an answer, we are offline.
+    if [ "$state" = network ] && ! is_online; then state=offline; fi
+    msg=$(failure_message "$state" "$remote" "$rc" "$name")
+    keep_failed_log "$runlog" "$name"
+    record_failure "$name" "$state" "$msg" "$(error_detail "$runlog")"
     record_run "$name" "$remote" "$local_dir" "$runlog" "$rc" "$state" "$started" "$ended" >/dev/null
-    case "$state" in
-        offline|rate-limited|locked) ;; # transient: no popup
-        *) notify_once "$name" "$state" "$urgency" "Drive sync failed: $name" "$msg" ;;
-    esac
     log "✗ $name sync failed (exit $rc, $state): $msg"
     SUMMARY+=("✗ $name: $state - $msg")
     case "$state" in
-        offline|rate-limited|locked) return 0 ;; # transient: retried next run
+        offline|network|rate-limited|locked|interrupted) return 0 ;; # transient: retried by itself
     esac
-    return "$rc"
+    return 1
+}
+
+# One warning a day, naming the remotes whose latest run printed rclone's notice. Says nothing
+# as soon as no remote does.
+notify_shared_client() {
+    local entry name list="" file="$STATE_DIR/client-id-notified-at" last now
+    for entry in "${REMOTES[@]}"; do
+        name=${entry%%|*}
+        [ -e "$STATE_DIR/$name.shared-client-id" ] && list="$list $(remote_of "$name")"
+    done
+    [ -n "$list" ] || return 0
+    now=$(date +%s)
+    last=0
+    [ -f "$file" ] && last=$(<"$file")
+    [ $((now - ${last:-0})) -ge "$CLIENT_NOTIFY_SECONDS" ] || return 0
+    notify normal "Drive sync: shared client ID" "Still on rclone's shared client, which is being retired:$list. Guide: $OAUTH_GUIDE"
+    printf '%s\n' "$now" >"$file"
+}
+
+# A failing remote nobody has seen succeed for hours. Skips are not failures.
+notify_stale() { # name
+    local st last_ok at now
+    st=$(sget "$1" state)
+    case "$st" in ok|pending|offline|battery-skip|"") return 0 ;; esac
+    last_ok=$(sget "$1" last_ok)
+    [ "${last_ok:-0}" -gt 0 ] 2>/dev/null || return 0
+    now=$(date +%s)
+    [ $((now - last_ok)) -ge "$STALE_NOTIFY_SECONDS" ] || return 0
+    at=$(sget "$1" stale_notified_at)
+    [ $((now - ${at:-0})) -ge "$RENOTIFY_SECONDS" ] || return 0
+    notify normal "Drive sync: $1 is out of date" "No successful sync for $(( (now - last_ok) / 3600 )) h ($st)."
+    status_set "$1" "stale_notified_at=$now"
 }
 
 # "Sync now" / "Verify now" asked for a summary notification when this run ends.
@@ -489,29 +945,20 @@ notify_summary() { # exit_code elapsed
     notify "$urgency" "$title ($(fmt_duration "$2"))" "$(printf '%s\n' "${SUMMARY[@]}")"
 }
 
+if [ "$MODE" = post-stop ]; then
+    post_stop
+    exit 0
+fi
+
+trap cleanup EXIT
+trap 'exit 143' TERM INT HUP
+
 rotate_log
 
 # Prune old local backups.
 fd -t d --min-depth 2 --max-depth 2 --changed-before "${BACKUP_KEEP_DAYS}d" . "$BACKUP_ROOT" -x rm -rf -- {} 2>/dev/null
 
-if [ "$MODE" = normal ] && [ -n "${DRIVE_SYNC_TIMER:-}" ] && battery_too_low; then
-    log "Battery below ${MIN_BATTERY}% and discharging; skipping timer run"
-    SUMMARY+=("Skipped: battery below ${MIN_BATTERY}%")
-    notify_summary 0 0
-    exit 0
-fi
-
-if ! is_online; then
-    log "Offline (no route to Google APIs); skipping"
-    for entry in "${REMOTES[@]}"; do
-        IFS='|' read -r name _ _ <<<"$entry"
-        [ "$TARGET" = all ] || [ "$TARGET" = "$name" ] || continue
-        write_status "$name" offline "No network"
-    done
-    SUMMARY+=("Skipped: offline (no route to Google APIs)")
-    notify_summary 0 0
-    exit 0
-fi
+detect_dead_runs
 
 selected=()
 for entry in "${REMOTES[@]}"; do
@@ -519,14 +966,87 @@ for entry in "${REMOTES[@]}"; do
     selected+=("$entry")
 done
 
+# Rotate the first remote so a shared quota is not always spent by the same one.
+if [ "$MODE" = normal ] && [ "${#selected[@]}" -gt 1 ]; then
+    turn=0
+    [ -f "$STATE_DIR/rotation" ] && turn=$(<"$STATE_DIR/rotation")
+    case "$turn" in ''|*[!0-9]*) turn=0 ;; esac
+    offset=$((turn % ${#selected[@]}))
+    selected=("${selected[@]:offset}" "${selected[@]:0:offset}")
+    printf '%s\n' "$((turn + 1))" >"$STATE_DIR/rotation"
+fi
+
 exit_code=0
-run_start=$(date +%s)
-i=0
+
+# The delete cap comes first: it is free, and it must show even offline or on low battery.
+if [ "$MODE" = normal ]; then
+    for entry in "${selected[@]}"; do
+        IFS='|' read -r name _ local_dir <<<"$entry"
+        delete_precheck "$name" "$local_dir"
+        [ -n "${DELETE_BLOCKED[$name]:-}" ] && exit_code=1
+    done
+elif [ "$MODE" = force ]; then
+    log "Delete cap bypassed by --force ($TARGET)"
+fi
+
+finish() { # exit code
+    local entry
+    for entry in "${REMOTES[@]}"; do notify_stale "${entry%%|*}"; done
+    notify_shared_client
+    notify_summary "$1" "$2"
+    exit "$1"
+}
+
+if [ "$MODE" = normal ] && [ "$TRIGGER" = timer ] && battery_too_low; then
+    log "Battery below ${MIN_BATTERY}% and discharging; skipping timer run"
+    for entry in "${selected[@]}"; do
+        write_skip_state "${entry%%|*}" battery-skip "Battery below ${MIN_BATTERY}%; paused until it charges. Sync now still works."
+    done
+    SUMMARY+=("Skipped: battery below ${MIN_BATTERY}%")
+    finish "$exit_code" 0
+fi
+
+# What will really run this time.
+torun=()
 for entry in "${selected[@]}"; do
-    i=$((i + 1))
-    IFS='|' read -r name remote local_dir <<<"$entry"
-    sync_remote "$name" "$remote" "$local_dir" "$i" "${#selected[@]}" || exit_code=1
+    name=${entry%%|*}
+    [ -n "${DELETE_BLOCKED[$name]:-}" ] && continue
+    if [ "$MODE" = normal ] && [ "$TRIGGER" = timer ] && why=$(timer_should_skip "$name"); then
+        log "Skipping $name: $why"
+        SUMMARY+=("Skipped $name: $why")
+        # Coming back from a skip state: show the failure that is really pending.
+        case "$(sget "$name" state)" in
+            offline|battery-skip)
+                failed=$(sget "$name" fail_class)
+                [ -n "$failed" ] && status_set "$name" "state=$failed" ;;
+        esac
+        continue
+    fi
+    torun+=("$entry")
 done
 
-notify_summary "$exit_code" $(( $(date +%s) - run_start ))
-exit "$exit_code"
+if [ "${#torun[@]}" -eq 0 ]; then
+    finish "$exit_code" 0
+fi
+
+if ! is_online; then
+    log "Offline (no route to Google APIs); skipping"
+    case "$MODE" in
+        resync|resync-preview) echo "drive-sync: offline, so $MODE did not run" >&2; exit 1 ;;
+    esac
+    for entry in "${torun[@]}"; do
+        write_skip_state "${entry%%|*}" offline "No network"
+    done
+    SUMMARY+=("Skipped: offline (no route to Google APIs)")
+    finish "$exit_code" 0
+fi
+
+run_start=$(date +%s)
+i=0
+for entry in "${torun[@]}"; do
+    i=$((i + 1))
+    IFS='|' read -r name remote local_dir <<<"$entry"
+    sync_remote "$name" "$remote" "$local_dir" "$i" "${#torun[@]}" || exit_code=1
+done
+
+finish "$exit_code" $(( $(date +%s) - run_start ))

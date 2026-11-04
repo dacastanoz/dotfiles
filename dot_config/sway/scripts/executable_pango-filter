@@ -1,13 +1,18 @@
 #!/usr/bin/python3
 """Run a command written for Polybar and show its output in a Waybar custom module.
 
-    pango-filter <command> [args...]
+    pango-filter [--json] <command> [args...]
 
 Translates the Polybar %{F#rrggbb}...%{F-} color tags in each output line to Pango
 markup, removes other Polybar tags, and escapes everything else. Lines are forwarded
 as they arrive, so it also works for commands that keep running.
+
+With --json, for modules with "return-type": "json": valid JSON lines pass through as
+they are, and anything else (such as the bar-errors fallback glyph) is converted and
+wrapped as JSON with class "error", so Waybar always gets valid input.
 """
 import html
+import json
 import re
 import signal
 import subprocess
@@ -38,9 +43,23 @@ def convert(line):
     return "".join(out)
 
 
+def convert_json(line):
+    if line.startswith("{"):
+        try:
+            json.loads(line)
+            return line
+        except ValueError:
+            pass
+    return json.dumps({"text": convert(line), "class": "error"})
+
+
 def main(argv):
+    translate = convert
+    if argv and argv[0] == "--json":
+        translate = convert_json
+        argv = argv[1:]
     if not argv:
-        print("usage: pango-filter <command> [args...]", file=sys.stderr)
+        print("usage: pango-filter [--json] <command> [args...]", file=sys.stderr)
         return 2
 
     # USR1/USR2 wake the wrapped tail scripts, matched with pkill -f, which also
@@ -59,7 +78,7 @@ def main(argv):
     signal.signal(signal.SIGHUP, stop)
     try:
         for line in child.stdout:
-            print(convert(line.rstrip("\n")), flush=True)
+            print(translate(line.rstrip("\n")), flush=True)
     except BrokenPipeError:
         child.terminate()
     return child.wait()

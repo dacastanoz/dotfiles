@@ -13,6 +13,10 @@ Nice=10
 IOSchedulingClass=idle
 CPUSchedulingPolicy=batch
 MemoryHigh=1G
-TimeoutStartSec=45min
+# No limit on the whole run: a large upload that is moving must not be killed. The script has a
+# per-remote watchdog for runs that stop making progress.
+TimeoutStartSec=infinity
+# Records a run the service manager or the kernel killed (OOM, signal), which the script cannot.
+ExecStopPost=%h/.local/bin/drive-sync --post-stop
 # A killed run leaves a bisync lock; --max-lock 2m + --recover handle it next time.
 KillMode=mixed

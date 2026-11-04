@@ -57,7 +57,7 @@ After a hardware change, refresh them with `chezmoi init && chezmoi apply`.
 
 - [ ] **Google Drive sync** (optional): `rclone config` to create the remotes, then
   `cp ~/.config/drive-sync/remotes.conf.example ~/.config/drive-sync/remotes.conf`, edit it,
-  run `drive-sync --resync <name>` once per remote and `chezmoi apply` (enables `drive-sync.timer`).
+  run `drive-sync --resync-preview <name>` and then `drive-sync --resync --confirmed <name>` once per remote and `chezmoi apply` (enables `drive-sync.timer`).
 - [ ] **Displays**: kanshi applies `mobile` (laptop only) or `docked` (any external screen on the right, scale 1.25) by itself. Arrange screens with `$mod+p` or `wdisplays`, then use "Save layout as profile..." in the Displays menu (saved profiles are per machine, in `~/.config/kanshi/profiles.d/`, and not in the repo).
 - [ ] **Wallpaper**: put an image at `~/.config/sway/wallpaper.png` (not shipped).
 - [ ] **Terminal toolkit**: install [Gentleman.Dots](https://github.com/Gentleman-Programming/Gentleman.Dots) with its own installer (nvim, tmux, fish, starship, ghostty shaders).
