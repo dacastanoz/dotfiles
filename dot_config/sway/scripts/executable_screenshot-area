@@ -1,6 +1,25 @@
 #!/bin/sh
-# Copy a selected area of the screen to the clipboard. Lives in a script because Sway
-# passes escaped quotes inside an exec string to the shell literally, which breaks
-# grim -g "$(slurp)". Cancelling the selection with Escape exits quietly.
+# Copy a selected area of the screen to the clipboard, as it was when the key was
+# pressed: the whole screen is captured first and cropped after selecting, so changes
+# during the selection are not in the result. Cancelling with Escape exits quietly.
+# Lives in a script because Sway passes escaped quotes in an exec string literally.
+shot=$(mktemp --suffix=.png "${XDG_RUNTIME_DIR:-/tmp}/screenshot.XXXXXX") || exit 1
+trap 'rm -f "$shot"' EXIT
+grim "$shot" || exit 1
+
 geometry=$(slurp) || exit 0
-grim -g "$geometry" - | wl-copy -t image/png && notify-send 'Screenshot copied to clipboard'
+
+# grim writes physical pixels at the largest output scale, starting at the layout
+# origin, while slurp reports logical coordinates.
+crop=$(swaymsg -t get_outputs | jq -r --arg geometry "$geometry" '
+    [.[] | select(.active)] as $outputs
+    | ($outputs | map(.scale) | max) as $scale
+    | ($outputs | map(.rect.x) | min) as $origin_x
+    | ($outputs | map(.rect.y) | min) as $origin_y
+    | ($geometry | capture("^(?<x>-?[0-9]+),(?<y>-?[0-9]+) (?<w>[0-9]+)x(?<h>[0-9]+)$")
+       | map_values(tonumber)) as $area
+    | "\($area.w * $scale | ceil)x\($area.h * $scale | ceil)+\(($area.x - $origin_x) * $scale | floor)+\(($area.y - $origin_y) * $scale | floor)"
+') || exit 1
+
+magick "$shot" -crop "$crop" +repage png:- | wl-copy -t image/png \
+    && notify-send 'Screenshot copied to clipboard'
