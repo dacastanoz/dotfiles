@@ -315,7 +315,7 @@ bindsym Mod1+Shift+space input type:keyboard xkb_switch_layout next
 
 # Screenshots (grim + slurp replace maim, wl-copy replaces xclip)
 # desc: Screenshot of an area, copied to the clipboard
-bindsym Print exec "grim -g \"$(slurp)\" - | wl-copy -t image/png && notify-send 'Screenshot copied to clipboard'"
+bindsym Print exec ~/.config/sway/scripts/screenshot-area
 # desc: Screenshot of the full screen, saved to ~/Pictures/Screenshots
 bindsym Shift+Print exec "grim ~/Pictures/Screenshots/$(date +%Y%m%d_%H%M%S).png && notify-send 'Screenshot saved'"
 

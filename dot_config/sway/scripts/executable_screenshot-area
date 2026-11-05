@@ -1,0 +1,6 @@
+#!/bin/sh
+# Copy a selected area of the screen to the clipboard. Lives in a script because Sway
+# passes escaped quotes inside an exec string to the shell literally, which breaks
+# grim -g "$(slurp)". Cancelling the selection with Escape exits quietly.
+geometry=$(slurp) || exit 0
+grim -g "$geometry" - | wl-copy -t image/png && notify-send 'Screenshot copied to clipboard'
