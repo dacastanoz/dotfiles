@@ -21,5 +21,7 @@ crop=$(swaymsg -t get_outputs | jq -r --arg geometry "$geometry" '
     | "\($area.w * $scale | ceil)x\($area.h * $scale | ceil)+\(($area.x - $origin_x) * $scale | floor)+\(($area.y - $origin_y) * $scale | floor)"
 ') || exit 1
 
-magick "$shot" -crop "$crop" +repage png:- | wl-copy -t image/png \
+# png24 keeps the plain RGB format grim writes; magick would otherwise shrink a colorless
+# area to grayscale, which Claude Desktop may not accept when pasting.
+magick "$shot" -crop "$crop" +repage -strip png24:- | wl-copy -t image/png \
     && notify-send 'Screenshot copied to clipboard'
